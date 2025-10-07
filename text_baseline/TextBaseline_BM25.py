@@ -264,7 +264,7 @@ def initialize_wandb(config: Dict):
             f'dataset-{dataset_name}', 'multi-masking-evaluation', 'pooled-documents']
 
     wandb.init(
-        project="ECIR2026",
+        project="project",
         name=run_name,
         config={
             'experiment_type': 'text_retrieval_baseline_bm25_pooled',

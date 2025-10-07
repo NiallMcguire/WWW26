@@ -647,8 +647,8 @@ if __name__ == "__main__":
     MAX_ICT_PAIRS = None  # None = ALL possible ICT pairs
 
     # File paths
-    text_path = "/users/gxb18167/SIGIR-Resource-Paper/Audio-Book-Alice/AliceChapterOne-EEG.csv"
-    eeg_base_path = "/users/gxb18167/SIGIR-Resource-Paper/Audio-Book-Alice/Subjects"
+    text_path = ""
+    eeg_base_path = ""
     output_file = "alice_ict_pairs_RUNTIME_MASKING.npy"
 
     print(f"📧 RUNTIME MASKING FEATURES:")
