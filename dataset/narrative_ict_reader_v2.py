@@ -201,7 +201,8 @@ class EnhancedNarrativeSentenceReader:
         return stimuli_sentences
 
     def extract_word_level_eeg(self, sentence_eeg: np.ndarray, fs: float,
-                               word_onsets: List[float], word_offsets: List[float]) -> List[np.ndarray]:
+                               word_onsets: List[float], word_offsets: List[float],
+                               sentence_start_time: float) -> List[np.ndarray]:
         """
         Extract word-level EEG segments from continuous sentence EEG
 
@@ -217,10 +218,9 @@ class EnhancedNarrativeSentenceReader:
             List of word-level EEG arrays, each shape [word_time_samples, channels]
         """
         word_eegs = []
-        sentence_start_time = 0.0  # Sentence EEG starts at time 0
 
         for onset, offset in zip(word_onsets, word_offsets):
-            # Convert times to sample indices relative to sentence start
+            # Convert ABSOLUTE times to RELATIVE times within sentence EEG
             word_start_sample = int((onset - sentence_start_time) * fs)
             word_end_sample = int((offset - sentence_start_time) * fs)
 
@@ -372,7 +372,8 @@ class EnhancedNarrativeSentenceReader:
                         word_eegs = self.extract_word_level_eeg(
                             sentence_eeg, fs,
                             sent_info['word_onsets'],
-                            sent_info['word_offsets']
+                            sent_info['word_offsets'],
+                            sent_info['start_time']  # Pass sentence start time for relative calculation
                         )
 
                         # ✅ NEW: Pad and stack into 3D array
