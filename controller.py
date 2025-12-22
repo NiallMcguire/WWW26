@@ -204,12 +204,12 @@ def main():
     # Data arguments
     parser.add_argument('--data_path', help='Path to ICT pairs .npy file')
     parser.add_argument('--data_paths', nargs='+', help='Paths to multiple ICT pairs .npy files')
-    # ============ UPDATED LINE: Added 'derco' to choices ============
-    parser.add_argument('--dataset_type', default='auto', choices=['auto', 'original', 'nieuwland', 'derco'],
-                        help='Dataset type: auto-detect, original format, nieuwland format, or derco format')
+    # ============ UPDATED LINE: Added 'derco', 'alice', 'narrative' to choices ============
+    parser.add_argument('--dataset_type', default='auto', choices=['auto', 'original', 'nieuwland', 'derco', 'alice', 'narrative'],
+                        help='Dataset type: auto-detect, original format, nieuwland format, derco format, alice format, or narrative format')
     parser.add_argument('--dataset_types', nargs='*', default=None,
-                        help='Dataset types for each path (auto, original, nieuwland, derco)')
-    # ================================================================
+                        help='Dataset types for each path (auto, original, nieuwland, derco, alice, narrative)')
+    # ========================================================================================
     parser.add_argument('--inspect_only', action='store_true', help='Only inspect dataset, don\'t train')
 
     # Model arguments

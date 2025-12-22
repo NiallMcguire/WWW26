@@ -5,20 +5,21 @@
 #SBATCH --time=20:00:00
 #SBATCH --mail-user=niall.mcguire@strath.ac.uk
 #SBATCH --mail-type=END
-#SBATCH --job-name=stbpr_3datasets
-#SBATCH --output=slurm-stbpr-3datasets-%j.out
+#SBATCH --job-name=stbpr_4datasets
+#SBATCH --output=slurm-stbpr-4datasets-%j.out
 
 module purge
 module load nvidia/sdk/23.3
 module load anaconda/python-3.9.7/2021.11
 
-# Run with all 3 datasets: Nieuwland (visual) + Alice (auditory) + DERCo (visual)
+# Run with all 4 datasets: Nieuwland (visual) + Alice (auditory) + DERCo (visual) + Narrative (auditory)
 python controller.py \
   --data_paths \
     /users/gxb18167/SIG_Audio_Visual_Router/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
     /users/gxb18167/SIG_Audio_Visual_Router/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     /users/gxb18167/WWW26/dataset/derco_ict_pairs_RUNTIME_MASKING.npy \
-  --dataset_types nieuwland alice derco \
+    /users/gxb18167/WWW26/dataset/narrative_ict_pairs_RUNTIME_MASKING.npy \
+  --dataset_types alice nieuwland derco narrative \
   --decomp_level sequence \
   --pooling_strategy mean \
   --query_type eeg \
