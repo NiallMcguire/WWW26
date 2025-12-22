@@ -204,12 +204,10 @@ def main():
     # Data arguments
     parser.add_argument('--data_path', help='Path to ICT pairs .npy file')
     parser.add_argument('--data_paths', nargs='+', help='Paths to multiple ICT pairs .npy files')
-    # ============ UPDATED LINE: Added 'derco' to choices ============
-    parser.add_argument('--dataset_type', default='auto', choices=['auto', 'original', 'nieuwland', 'derco'],
-                        help='Dataset type: auto-detect, original format, nieuwland format, or derco format')
+    parser.add_argument('--dataset_type', default='auto', choices=['auto', 'original', 'nieuwland'],
+                        help='Dataset type: auto-detect, original format, or nieuwland format')
     parser.add_argument('--dataset_types', nargs='*', default=None,
-                        help='Dataset types for each path (auto, original, nieuwland, derco)')
-    # ================================================================
+                        help='Dataset types for each path (auto, original, nieuwland)')
     parser.add_argument('--inspect_only', action='store_true', help='Only inspect dataset, don\'t train')
 
     # Model arguments
@@ -261,7 +259,7 @@ def main():
     parser.add_argument('--use_sequence_concat', action='store_true',
                         help='Concatenate EEG words into sequences before encoding (baseline for decomposition)')
 
-    # UPDATED Multi-masking validation arguments for DYNAMIC approach
+    # Multi-masking validation arguments
     parser.add_argument('--enable_multi_masking_validation', action='store_true',
                         help='Enable DYNAMIC validation across multiple masking levels during training')
     parser.add_argument('--validation_masking_levels', nargs='+', type=int,
@@ -273,7 +271,6 @@ def main():
                         help='Primary masking level for early stopping (default: 90)')
     parser.add_argument('--training_masking_level', type=int, default=90,
                         help='Masking level used during training (default: 90)')
-    # Add to parser arguments section
     parser.add_argument('--test_masking_levels', nargs='+', type=int,
                         default=[0, 25, 50, 75, 90, 100],
                         help='Masking percentages to evaluate during testing (default: 0 25 50 75 90 100)')
@@ -285,8 +282,6 @@ def main():
     parser.add_argument('--split_by_subject', action='store_true',
                         help='Split data by subject (out-of-subject evaluation)')
 
-
-    # Add after the temporal-spatial decomposition arguments (around line 260)
     parser.add_argument('--ablation_mode', default='none',
                         choices=['none', 'temporal_only', 'spatial_only'],
                         help='Ablation mode: none (full model), temporal_only, or spatial_only')
@@ -338,7 +333,6 @@ def main():
     print(f"Tokenizer vocabulary size: {len(tokenizer)}")
 
     # Create DYNAMIC dataloaders
-    # Create DYNAMIC dataloaders
     print(f"\nCreating DYNAMIC dataloaders...")
     if global_eeg_dims is None:  # Single dataset - compute dimensions
         train_dataloader, val_dataloader, test_dataloader, global_eeg_dims = create_dynamic_dataloaders(
@@ -373,7 +367,6 @@ def main():
         'lora_alpha': args.lora_alpha, 'pooling_strategy': args.pooling_strategy,
         'encoder_type': args.encoder_type, 'query_type': args.query_type,
         'use_pretrained_text': args.use_pretrained_text,
-        # DYNAMIC Multi-masking validation configuration
         'enable_multi_masking_validation': args.enable_multi_masking_validation,
         'validation_masking_levels': args.validation_masking_levels,
         'multi_masking_frequency': args.multi_masking_frequency,
@@ -400,14 +393,25 @@ def main():
     else:
         print(f"Multi-masking validation: DISABLED")
 
-    # CREATE MODEL
+    # ============================================================
+    # FIX: CREATE MODEL WITH global_eeg_dims BEFORE OPTIMIZER
+    # This ensures EEG encoders are initialized immediately
+    # ============================================================
     print(f"\n=== MODEL CREATION ===")
+    print(f"Global EEG dimensions: {global_eeg_dims}")
+
     model = create_model(
-        colbert_model_name=args.colbert_model_name, hidden_dim=args.hidden_dim,
-        eeg_arch=args.eeg_arch, device=device, use_lora=not args.no_lora,
-        lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-        pooling_strategy=args.pooling_strategy, encoder_type=args.encoder_type,
-        global_eeg_dims=global_eeg_dims, query_type=args.query_type,
+        colbert_model_name=args.colbert_model_name,
+        hidden_dim=args.hidden_dim,
+        eeg_arch=args.eeg_arch,
+        device=device,
+        use_lora=not args.no_lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        pooling_strategy=args.pooling_strategy,
+        encoder_type=args.encoder_type,
+        global_eeg_dims=global_eeg_dims,  # ✅ FIX: Pass this to create encoders immediately
+        query_type=args.query_type,
         use_pretrained_text=args.use_pretrained_text,
         use_temporal_spatial_decomp=args.use_temporal_spatial_decomp,
         decomp_level=args.decomp_level,
@@ -443,8 +447,73 @@ def main():
     config.update({'total_params': total_params, 'trainable_params': trainable_params})
     save_experiment_config(config, output_dir)
 
-    # CREATE OPTIMIZER AND TRAIN
+    # ============================================================
+    # CREATE OPTIMIZER - Now all parameters are already in model
+    # ============================================================
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    # ============================================================
+    # VERIFICATION: Check if all parameters are in optimizer
+    # ============================================================
+    print("\n=== PARAMETER VERIFICATION ===")
+
+    # Count parameters in optimizer
+    optimizer_params = []
+    for param_group in optimizer.param_groups:
+        optimizer_params.extend(param_group['params'])
+    print(f"Parameters in optimizer: {len(optimizer_params)}")
+
+    # Count parameters in model
+    model_params = list(model.parameters())
+    print(f"Parameters in model: {len(model_params)}")
+
+    # Check if EEG encoders exist
+    # Check if EEG encoders exist
+    if model.use_temporal_spatial_decomp:
+        print(f"Temporal encoder exists: {model.temporal_eeg_encoder is not None}")
+        print(f"Spatial encoder exists: {model.spatial_eeg_encoder is not None}")
+    elif hasattr(model, 'eeg_encoder'):
+        print(f"EEG encoder exists: {model.eeg_encoder is not None}")
+    else:
+        print(f"EEG encoder: Not initialized (will be created dynamically)")
+    # Verify all parameters are in optimizer
+    param_ids_in_optimizer = {id(p) for p in optimizer_params}
+    missing_params = [p for p in model_params if id(p) not in param_ids_in_optimizer]
+
+    if len(missing_params) > 0:
+        print(f"\n❌ ERROR: {len(missing_params)} parameters are NOT in optimizer!")
+        print("These parameters will NOT be trained!")
+
+        # Check specifically for EEG encoder parameters
+        if hasattr(model, 'eeg_encoder') and model.eeg_encoder is not None:
+            eeg_params = list(model.eeg_encoder.parameters())
+            eeg_params_missing = [p for p in eeg_params if id(p) not in param_ids_in_optimizer]
+            if len(eeg_params_missing) > 0:
+                print(f"  - EEG encoder: {len(eeg_params_missing)}/{len(eeg_params)} parameters missing")
+
+        if model.use_temporal_spatial_decomp:
+            if hasattr(model, 'temporal_eeg_encoder') and model.temporal_eeg_encoder is not None:
+                temp_params = list(model.temporal_eeg_encoder.parameters())
+                temp_params_missing = [p for p in temp_params if id(p) not in param_ids_in_optimizer]
+                if len(temp_params_missing) > 0:
+                    print(f"  - Temporal encoder: {len(temp_params_missing)}/{len(temp_params)} parameters missing")
+
+            if hasattr(model, 'spatial_eeg_encoder') and model.spatial_eeg_encoder is not None:
+                spat_params = list(model.spatial_eeg_encoder.parameters())
+                spat_params_missing = [p for p in spat_params if id(p) not in param_ids_in_optimizer]
+                if len(spat_params_missing) > 0:
+                    print(f"  - Spatial encoder: {len(spat_params_missing)}/{len(spat_params)} parameters missing")
+
+        raise RuntimeError("Dynamic parameter problem detected! Fix failed.")
+    else:
+        print(f"✅ SUCCESS: All {len(model_params)} model parameters are in the optimizer")
+        print("All parameters will be trained correctly!")
+
+    print("=" * 60)
+
+    # ============================================================
+    # TRAINING
+    # ============================================================
     print(f"\n=== TRAINING START (DYNAMIC MASKING) ===")
 
     trained_model = train_model(
@@ -457,7 +526,6 @@ def main():
         device=device,
         debug=args.debug,
         config=config,
-        # DYNAMIC Multi-masking validation parameters
         enable_multi_masking_validation=args.enable_multi_masking_validation,
         multi_masking_frequency=args.multi_masking_frequency,
         validation_masking_levels=args.validation_masking_levels,
@@ -473,14 +541,12 @@ def main():
     }, model_save_path)
     print(f"Saved trained model to: {model_save_path}")
 
-    # TEST EVALUATION with actual held-out test set
+    # TEST EVALUATION
     if args.enable_test_evaluation:
         print(f"\n=== TEST SET EVALUATION (HELD-OUT) ===")
 
-        # Import the test function
         from mv_training import test_model
 
-        # Run comprehensive test evaluation on ACTUAL TEST SET
         test_results = test_model(
             model=trained_model,
             test_dataloader=test_dataloader,
@@ -494,6 +560,7 @@ def main():
     else:
         print(
             "Test evaluation skipped. Use --enable_test_evaluation to run comprehensive testing on held-out test set.")
+
     finish_wandb()
     print(f"\n=== TRAINING COMPLETE ===")
     print(f"Results saved in: {output_dir}")
