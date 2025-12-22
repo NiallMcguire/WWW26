@@ -15,8 +15,8 @@ module load anaconda/python-3.9.7/2021.11
 # Run with all 3 datasets: Nieuwland (visual) + Alice (auditory) + DERCo (visual)
 python controller.py \
   --data_paths \
-    /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
-    /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
+    /users/gxb18167/SIG_Audio_Visual_Router/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
+    /users/gxb18167/SIG_Audio_Visual_Router/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     /users/gxb18167/WWW26/dataset/derco_ict_pairs_RUNTIME_MASKING.npy \
   --dataset_types nieuwland alice derco \
   --decomp_level sequence \
