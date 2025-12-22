@@ -299,61 +299,47 @@ class EnhancedNarrativeSentenceReader:
         for subj_path in tqdm(subject_paths, desc="Processing subjects"):
             subject_id = os.path.basename(subj_path)
 
-            # Get all run paths for this subject in deterministic order
-            run_paths = sorted([
-                os.path.join(subj_path, run)
-                for run in os.listdir(subj_path)
-                if run.startswith('Run') and os.path.isdir(os.path.join(subj_path, run))
+            # Get all EEG .mat files for this subject (FLAT structure - no subdirectories)
+            # Files are named like: Subject11_Run1.mat, Subject11_Run2.mat, etc.
+            eeg_files = sorted([
+                f for f in os.listdir(subj_path)
+                if f.endswith('.mat') and f.startswith(subject_id) and 'Run' in f
             ])
 
             # Limit runs if requested
             if self.limit_runs_per_subject is not None:
-                run_paths = run_paths[:self.limit_runs_per_subject]
+                eeg_files = eeg_files[:self.limit_runs_per_subject]
 
-            for run_path in run_paths:
-                run_id = os.path.basename(run_path)
+            for eeg_filename in eeg_files:
+                eeg_file_path = os.path.join(subj_path, eeg_filename)
 
-                # Find EEG and stimuli files
-                eeg_file = None
-                stimuli_file = None
-                for file in os.listdir(run_path):
-                    if file.endswith('_EEG.mat'):
-                        eeg_file = os.path.join(run_path, file)
-                    elif file.endswith('_Stimuli.mat'):
-                        stimuli_file = os.path.join(run_path, file)
+                # Extract run number from filename (e.g., Subject11_Run5.mat -> "5")
+                run_match = re.search(r'Run(\d+)', eeg_filename, re.IGNORECASE)
+                if not run_match:
+                    if self.verbose:
+                        print(f"⚠ Could not extract run number from {eeg_filename}")
+                    continue
 
-                if not eeg_file or not stimuli_file:
+                run_num = run_match.group(1)
+                run_id = f"Run{run_num}"
+
+                # Construct text file name to match (e.g., "Run5.mat")
+                text_key = f"Run{run_num}.mat"
+
+                if text_key not in stimuli_sentences:
+                    if self.verbose:
+                        print(f"⚠ Text file {text_key} not found for {eeg_filename}")
                     continue
 
                 try:
                     # Load EEG data
-                    eeg_data_raw = sio.loadmat(eeg_file)['eegData']
+                    eeg_data_raw = sio.loadmat(eeg_file_path)['eegData']
                     original_fs = 128.0  # Narrative dataset sampling rate
 
                     # Preprocess EEG
                     eeg_data, fs = self.preprocess_eeg(eeg_data_raw, original_fs)
 
-                    # Get stimuli info
-                    # Extract run number from stimuli filename
-                    # Format: SubjectXX_RunYY_Stimuli.mat -> need to match with RunYY.mat from text folder
-                    stimuli_basename = os.path.basename(stimuli_file)
-
-                    # Try to extract run number
-                    run_match = re.search(r'Run(\d+)', stimuli_basename, re.IGNORECASE)
-                    if not run_match:
-                        if self.verbose:
-                            print(f"⚠ Could not extract run number from {stimuli_basename}")
-                        continue
-
-                    # Construct the expected text file name
-                    run_num = run_match.group(1)
-                    text_key = f"Run{run_num}.mat"
-
-                    if text_key not in stimuli_sentences:
-                        if self.verbose:
-                            print(f"⚠ Text file {text_key} not found for {stimuli_basename}")
-                        continue
-
+                    # Get sentences for this run from text file
                     sentences = stimuli_sentences[text_key]
 
                     # Process each sentence
