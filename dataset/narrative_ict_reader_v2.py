@@ -9,6 +9,7 @@ UPDATED Narrative EEG Reader with RUNTIME MASKING SUPPORT (v3)
 """
 
 import os
+import re
 import numpy as np
 import scipy.io as sio
 import torch
@@ -333,11 +334,27 @@ class EnhancedNarrativeSentenceReader:
                     eeg_data, fs = self.preprocess_eeg(eeg_data_raw, original_fs)
 
                     # Get stimuli info
-                    stimuli_key = os.path.basename(stimuli_file)
-                    if stimuli_key not in stimuli_sentences:
+                    # Extract run number from stimuli filename
+                    # Format: SubjectXX_RunYY_Stimuli.mat -> need to match with RunYY.mat from text folder
+                    stimuli_basename = os.path.basename(stimuli_file)
+
+                    # Try to extract run number
+                    run_match = re.search(r'Run(\d+)', stimuli_basename, re.IGNORECASE)
+                    if not run_match:
+                        if self.verbose:
+                            print(f"⚠ Could not extract run number from {stimuli_basename}")
                         continue
 
-                    sentences = stimuli_sentences[stimuli_key]
+                    # Construct the expected text file name
+                    run_num = run_match.group(1)
+                    text_key = f"Run{run_num}.mat"
+
+                    if text_key not in stimuli_sentences:
+                        if self.verbose:
+                            print(f"⚠ Text file {text_key} not found for {stimuli_basename}")
+                        continue
+
+                    sentences = stimuli_sentences[text_key]
 
                     # Process each sentence
                     for sent_info in sentences:
