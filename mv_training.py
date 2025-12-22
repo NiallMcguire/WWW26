@@ -8,7 +8,22 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
+# Optional wandb import - if not available, use dummy
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    # Create dummy wandb module
+    class DummyWandb:
+        def init(self, *args, **kwargs):
+            pass
+        def log(self, *args, **kwargs):
+            pass
+        def finish(self):
+            pass
+    wandb = DummyWandb()
+    print("⚠️  WARNING: wandb not available - logging disabled")
 import numpy as np
 from mv_models import compute_similarity
 from mv_dataloader import create_positive_negative_pairs
@@ -1837,6 +1852,9 @@ def validate_epoch(model, val_dataloader, device, epoch_num,
 
 def initialize_wandb(config):
     """Initialize wandb logging"""
+    if not WANDB_AVAILABLE:
+        print("⚠️  wandb not available - skipping initialization")
+        return
 
     # Create descriptive run name
     encoder_type = config.get('encoder_type', 'dual')
@@ -2128,4 +2146,7 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs,
 
 def finish_wandb():
     """Finish wandb run"""
-    wandb.finish()
+    if WANDB_AVAILABLE:
+        wandb.finish()
+    else:
+        print("⚠️  wandb not available - skipping finish")
