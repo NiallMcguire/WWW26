@@ -1685,7 +1685,8 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
                  decomp_level='word', use_dual_loss=False,
                  lambda_temporal=1.0, lambda_spatial=1.0, use_sequence_concat=False,
                  use_cnn_preprocessing=False,
-                 ablation_mode='none', ablation_match_params=True):  # ADD THIS PARAMETER
+                 ablation_mode='none', ablation_match_params=True,
+                 eeg_spatial_temporal_pooling='max'):  # ADD THIS PARAMETER
     if encoder_type == 'dual':
         model = SimplifiedBrainRetrieval(
             colbert_model_name=colbert_model_name,
@@ -1701,8 +1702,9 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
             decomp_level=decomp_level,
             use_sequence_concat=use_sequence_concat,
             use_cnn_preprocessing=use_cnn_preprocessing,
-            ablation_mode=ablation_mode,  # ADD THIS
-            ablation_match_params=ablation_match_params  # ADD THIS
+            ablation_mode=ablation_mode,
+            ablation_match_params=ablation_match_params,
+            eeg_spatial_temporal_pooling=eeg_spatial_temporal_pooling
         )
         model.use_dual_loss = use_dual_loss
         model.lambda_temporal = lambda_temporal
