@@ -10,9 +10,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 # Optional wandb import - if not available, use dummy
 try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
+    import wandb as _wandb_module
+    # Check if the imported module has the required attributes
+    # (handles case where a local wandb.py file shadows the real package)
+    if hasattr(_wandb_module, 'init') and callable(getattr(_wandb_module, 'init', None)):
+        wandb = _wandb_module
+        WANDB_AVAILABLE = True
+    else:
+        raise ImportError("Imported wandb module doesn't have expected attributes (possible file shadowing)")
+except (ImportError, AttributeError) as e:
     WANDB_AVAILABLE = False
     # Create dummy wandb module
     class DummyWandb:
@@ -22,8 +28,10 @@ except ImportError:
             pass
         def finish(self):
             pass
+        def watch(self, *args, **kwargs):
+            pass
     wandb = DummyWandb()
-    print("⚠️  WARNING: wandb not available - logging disabled")
+    print(f"⚠️  WARNING: wandb not available - logging disabled (reason: {str(e)})")
 import numpy as np
 from mv_models import compute_similarity
 from mv_dataloader import create_positive_negative_pairs
