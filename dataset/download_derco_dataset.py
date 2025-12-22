@@ -32,11 +32,25 @@ def download_file(url, output_path):
 
 
 def get_folder_contents(folder_id):
-    """Get contents of OSF folder"""
+    """Get contents of OSF folder with pagination support"""
     url = f"https://api.osf.io/v2/nodes/rkqbu/files/osfstorage/{folder_id}/"
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()
+
+    all_items = []
+    while url:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+        all_items.extend(data.get('data', []))
+
+        # Check for next page
+        url = data.get('links', {}).get('next')
+        if url:
+            print(f"  📄 Fetching next page...")
+            time.sleep(0.2)  # Be nice to the API
+
+    # Return in the same format as before
+    return {'data': all_items}
 
 
 # Hardcoded folder ID for preprocessed data (already discovered)
