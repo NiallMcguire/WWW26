@@ -5,14 +5,15 @@
 #SBATCH --time=20:00:00
 #SBATCH --mail-user=niall.mcguire@strath.ac.uk
 #SBATCH --mail-type=END
-#SBATCH --job-name=stbpr_4datasets
-#SBATCH --output=slurm-stbpr-4datasets-%j.out
+#SBATCH --job-name=stbpr_4datasets_max
+#SBATCH --output=slurm-stbpr-4datasets-max-%j.out
 
 module purge
 module load nvidia/sdk/23.3
 module load anaconda/python-3.9.7/2021.11
 
 # Run with all 4 datasets: Nieuwland (visual) + Alice (auditory) + DERCo (visual) + Narrative (auditory)
+# Using MAX pooling for spatial-temporal decomposition
 python controller.py \
   --data_paths \
     /users/gxb18167/SIG_Audio_Visual_Router/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
@@ -25,6 +26,7 @@ python controller.py \
   --query_type eeg \
   --no_lora \
   --eeg_arch transformer \
+  --eeg_spatial_temporal_pooling max \
   --colbert_model_name colbert-ir/colbertv2.0 \
   --lr 1e-4 --patience 3 --epochs 100 --batch_size 32 --max_text_len 256 \
   --enable_multi_masking_validation --validation_masking_levels 90 \

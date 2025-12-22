@@ -116,6 +116,7 @@ class EEGPositionalEmbeddings(nn.Module):
 
             return x + temp_emb
 
+
 class SimpleTextEncoder(nn.Module):
     """Simple text encoder trained from scratch (similar complexity to EEG encoder)"""
 
@@ -189,7 +190,8 @@ class SimplifiedBrainRetrieval(nn.Module):
                  use_pretrained_text=True, use_temporal_spatial_decomp=False,
                  decomp_level='word', use_sequence_concat=False,
                  use_cnn_preprocessing=False,
-                 ablation_mode='none', ablation_match_params=True):
+                 ablation_mode='none', ablation_match_params=True,
+                 eeg_spatial_temporal_pooling='max'):
         super().__init__()
 
         self.query_type = query_type
@@ -204,10 +206,13 @@ class SimplifiedBrainRetrieval(nn.Module):
         self.use_cnn_preprocessing = use_cnn_preprocessing
         self.ablation_mode = ablation_mode
         self.ablation_match_params = ablation_match_params
+        self.eeg_spatial_temporal_pooling = eeg_spatial_temporal_pooling
 
         # Validate ablation settings
         if ablation_mode != 'none' and not use_temporal_spatial_decomp:
             raise ValueError("ablation_mode requires use_temporal_spatial_decomp=True")
+
+        print(f"EEG spatial-temporal pooling: {eeg_spatial_temporal_pooling}")
 
         # Create separate encoders for temporal/spatial if needed
         if use_temporal_spatial_decomp:
@@ -256,6 +261,37 @@ class SimplifiedBrainRetrieval(nn.Module):
         if pooling_strategy not in ['multi', 'cls', 'max', 'mean']:
             raise ValueError(
                 f"Only 'multi', 'cls', 'max', and 'mean' pooling strategies supported, got: {pooling_strategy}")
+
+        # Validate spatial-temporal pooling strategy
+        if eeg_spatial_temporal_pooling not in ['max', 'mean', 'cls']:
+            raise ValueError(
+                f"Only 'max', 'mean', and 'cls' EEG spatial-temporal pooling supported, got: {eeg_spatial_temporal_pooling}")
+
+        # Initialize CLS token pooling components if needed
+        if eeg_spatial_temporal_pooling == 'cls' and use_temporal_spatial_decomp:
+            # CLS tokens for temporal and spatial pooling
+            self.temporal_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+            self.spatial_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+            # Self-attention layers for CLS pooling
+            self.temporal_cls_attention = nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True
+            )
+            self.spatial_cls_attention = nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True
+            )
+            print(f"Initialized CLS token pooling for spatial-temporal decomposition")
+        else:
+            self.temporal_cls_token = None
+            self.spatial_cls_token = None
+            self.temporal_cls_attention = None
+            self.spatial_cls_attention = None
 
         # Text encoder - either pretrained or simple from-scratch
         if use_pretrained_text:
@@ -321,14 +357,95 @@ class SimplifiedBrainRetrieval(nn.Module):
         print(f"Use sequence concat: {use_sequence_concat}")
         print(f"Text encoder dimension: {encoder_dim} -> {hidden_dim}")
 
+    def _pool_eeg_dimension(self, eeg_data, pool_dim, pool_type='temporal'):
+        """
+        Apply pooling strategy to a specific dimension of EEG data
+
+        Args:
+            eeg_data: Input tensor to pool
+            pool_dim: Dimension to pool over (2 for temporal, 3 for spatial in word-level)
+            pool_type: 'temporal' or 'spatial' (for CLS token selection)
+
+        Returns:
+            Pooled tensor
+        """
+        if self.eeg_spatial_temporal_pooling == 'max':
+            return torch.max(eeg_data, dim=pool_dim)[0]
+
+        elif self.eeg_spatial_temporal_pooling == 'mean':
+            return torch.mean(eeg_data, dim=pool_dim)
+
+        elif self.eeg_spatial_temporal_pooling == 'cls':
+            # CLS token pooling with self-attention
+            batch_size = eeg_data.shape[0]
+
+            # Select appropriate CLS token and attention layer
+            if pool_type == 'temporal':
+                cls_token = self.temporal_cls_token
+                attention_layer = self.temporal_cls_attention
+            else:  # spatial
+                cls_token = self.spatial_cls_token
+                attention_layer = self.spatial_cls_attention
+
+            # Reshape data for attention: need [batch, seq_len, hidden_dim]
+            # For word-level: eeg_data is [batch, words, time, channels]
+            # For sequence-level: different shapes
+
+            if len(eeg_data.shape) == 4:  # Word-level [batch, words, time, channels]
+                if pool_dim == 3:  # Pooling over channels (temporal)
+                    # Reshape: [batch, words, time, channels] -> [batch*words, time, channels]
+                    b, w, t, c = eeg_data.shape
+                    data_reshaped = eeg_data.view(b * w, t, c)
+
+                    # Expand CLS token for batch
+                    cls_expanded = cls_token.expand(b * w, -1, -1)  # [batch*words, 1, channels]
+
+                    # Apply attention: CLS token attends to time dimension
+                    pooled, _ = attention_layer(cls_expanded, data_reshaped, data_reshaped)
+                    pooled = pooled.squeeze(1)  # [batch*words, channels]
+
+                    # Reshape back: [batch*words, channels] -> [batch, words, channels]
+                    pooled = pooled.view(b, w, c)
+
+                elif pool_dim == 2:  # Pooling over time (spatial)
+                    # Reshape: [batch, words, time, channels] -> [batch*words, time, channels]
+                    b, w, t, c = eeg_data.shape
+                    data_reshaped = eeg_data.view(b * w, t, c)
+
+                    # Expand CLS token
+                    cls_expanded = cls_token.expand(b * w, -1, -1)  # [batch*words, 1, hidden]
+
+                    # Apply attention: CLS token attends to time dimension
+                    pooled, _ = attention_layer(cls_expanded, data_reshaped, data_reshaped)
+                    pooled = pooled.squeeze(1)  # [batch*words, hidden]
+
+                    # Reshape back
+                    pooled = pooled.view(b, w, -1)
+
+            else:  # Sequence-level [batch, seq_len, features]
+                # Expand CLS token for batch
+                cls_expanded = cls_token.expand(batch_size, -1, -1)
+
+                # Apply attention
+                pooled, _ = attention_layer(cls_expanded, eeg_data, eeg_data)
+                pooled = pooled.squeeze(1)  # [batch, hidden_dim]
+
+            return pooled
+
+        else:
+            raise ValueError(f"Unknown pooling strategy: {self.eeg_spatial_temporal_pooling}")
+
     def _apply_temporal_spatial_decomposition(self, eeg_input):
-        """Apply temporal-spatial decomposition to EEG data"""
+        """Apply temporal-spatial decomposition to EEG data with configurable pooling"""
         batch_size, num_words, time_samples, channels = eeg_input.shape
 
         if self.decomp_level == 'word':
             # Word-level: decompose each word separately
-            temporal_features = torch.max(eeg_input, dim=3)[0]  # [batch, words, time]
-            spatial_features = torch.max(eeg_input, dim=2)[0]  # [batch, words, channels]
+            # Temporal: pool over channels (dim=3) -> [batch, words, time]
+            # Spatial: pool over time (dim=2) -> [batch, words, channels]
+
+            temporal_features = self._pool_eeg_dimension(eeg_input, pool_dim=3, pool_type='temporal')
+            spatial_features = self._pool_eeg_dimension(eeg_input, pool_dim=2, pool_type='spatial')
 
             return temporal_features, spatial_features
 
@@ -336,8 +453,11 @@ class SimplifiedBrainRetrieval(nn.Module):
             # Sequence-level: concatenate all words then decompose
             eeg_concat = eeg_input.view(batch_size, num_words * time_samples, channels)
 
-            temporal_features = torch.max(eeg_concat, dim=2)[0]  # [batch, total_time]
-            spatial_features = torch.max(eeg_concat, dim=1)[0]  # [batch, channels]
+            # Temporal: pool over channels (dim=2) -> [batch, total_time]
+            # Spatial: pool over time (dim=1) -> [batch, channels]
+
+            temporal_features = self._pool_eeg_dimension(eeg_concat, pool_dim=2, pool_type='temporal')
+            spatial_features = self._pool_eeg_dimension(eeg_concat, pool_dim=1, pool_type='spatial')
 
             # Reshape for consistent interface
             temporal_features = temporal_features.unsqueeze(1)  # [batch, 1, total_time]
@@ -1246,6 +1366,32 @@ class CrossEncoderBrainRetrieval(nn.Module):
         self.use_pretrained_text = use_pretrained_text
         self.pooling_strategy = 'cross'
 
+        # Initialize CLS token pooling components if needed
+        if eeg_spatial_temporal_pooling == 'cls' and use_temporal_spatial_decomp:
+            # CLS tokens for temporal and spatial pooling
+            self.temporal_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+            self.spatial_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+            # Self-attention layers for CLS pooling
+            self.temporal_cls_attention = nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True
+            )
+            self.spatial_cls_attention = nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True
+            )
+            print(f"Initialized CLS token pooling for spatial-temporal decomposition")
+        else:
+            self.temporal_cls_token = None
+            self.spatial_cls_token = None
+            self.temporal_cls_attention = None
+            self.spatial_cls_attention = None
+
         # Text encoder - either pretrained or simple from-scratch
         if use_pretrained_text:
             # Original pretrained approach
@@ -1444,7 +1590,6 @@ class CrossEncoderBrainRetrieval(nn.Module):
         return scores
 
 
-
 def compute_similarity(query_vectors, doc_vectors, pooling_strategy, temperature=1.0):
     """Compute similarity based on pooling strategy"""
 
@@ -1456,6 +1601,7 @@ def compute_similarity(query_vectors, doc_vectors, pooling_strategy, temperature
         return compute_cls_similarity(query_vectors, doc_vectors, temperature)
     else:
         raise ValueError(f"Unknown pooling strategy: {pooling_strategy}")
+
 
 def compute_multi_vector_similarity(query_vectors, doc_vectors, temperature=1.0):
     """Compute ColBERT-style MaxSim similarity for multi-vectors"""
@@ -1539,7 +1685,7 @@ def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
                  decomp_level='word', use_dual_loss=False,
                  lambda_temporal=1.0, lambda_spatial=1.0, use_sequence_concat=False,
                  use_cnn_preprocessing=False,
-                 ablation_mode='none', ablation_match_params=True): # ADD THIS PARAMETER
+                 ablation_mode='none', ablation_match_params=True):  # ADD THIS PARAMETER
     if encoder_type == 'dual':
         model = SimplifiedBrainRetrieval(
             colbert_model_name=colbert_model_name,

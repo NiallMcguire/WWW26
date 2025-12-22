@@ -251,6 +251,8 @@ def main():
                         help='Enable temporal-spatial decomposition for EEG')
     parser.add_argument('--decomp_level', default='word', choices=['word', 'sequence'],
                         help='Level of decomposition: word-level or sequence-level')
+    parser.add_argument('--eeg_spatial_temporal_pooling', default='max', choices=['max', 'mean', 'cls'],
+                        help='Pooling strategy for spatial-temporal decomposition: max, mean, or cls (CLS token with self-attention)')
     parser.add_argument('--use_dual_loss', action='store_true',
                         help='Use dual loss for temporal and spatial components')
     parser.add_argument('--lambda_temporal', type=float, default=1.0,
@@ -417,7 +419,8 @@ def main():
         use_sequence_concat=args.use_sequence_concat,
         use_cnn_preprocessing=args.use_cnn_preprocessing,
         ablation_mode=args.ablation_mode,
-        ablation_match_params=args.ablation_match_params
+        ablation_match_params=args.ablation_match_params,
+        eeg_spatial_temporal_pooling=args.eeg_spatial_temporal_pooling
     )
 
     config.update({
@@ -429,7 +432,8 @@ def main():
         'use_sequence_concat': args.use_sequence_concat,
         'use_cnn_preprocessing': args.use_cnn_preprocessing,
         'ablation_mode': args.ablation_mode,
-        'ablation_match_params': args.ablation_match_params
+        'ablation_match_params': args.ablation_match_params,
+        'eeg_spatial_temporal_pooling': args.eeg_spatial_temporal_pooling
     })
 
     if not args.use_pretrained_text:
