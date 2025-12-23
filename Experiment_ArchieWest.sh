@@ -14,15 +14,16 @@ module load anaconda/python-3.9.7/2021.11
 
 # Run with all 4 datasets: Nieuwland (visual) + Alice (auditory) + DERCo (visual) + Narrative (auditory)
 # Using MAX pooling for spatial-temporal decomposition
+    #/users/gxb18167/WWW26/dataset/derco_ict_pairs_RUNTIME_MASKING.npy \
+    #/users/gxb18167/WWW26/dataset/narrative_ict_pairs_RUNTIME_MASKING.npy \
+    #derco narrative \
 python controller.py \
   --data_paths \
     /users/gxb18167/SIG_Audio_Visual_Router/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
     /users/gxb18167/SIG_Audio_Visual_Router/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
-    /users/gxb18167/WWW26/dataset/derco_ict_pairs_RUNTIME_MASKING.npy \
-    /users/gxb18167/WWW26/dataset/narrative_ict_pairs_RUNTIME_MASKING.npy \
-  --dataset_types alice nieuwland derco narrative \
+  --dataset_types alice nieuwland  \
   --decomp_level sequence \
-  --pooling_strategy mean \
+  --pooling_strategy cls \
   --query_type eeg \
   --no_lora \
   --eeg_arch transformer \
