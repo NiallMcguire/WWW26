@@ -1935,7 +1935,7 @@ def initialize_wandb(config):
         tags.append(f"decomp-{config.get('decomp_level', 'word')}")
 
     wandb.init(
-        project="project",
+        project="WWW2026",
         name=run_name,
         config={
             'encoder_type': encoder_type,
