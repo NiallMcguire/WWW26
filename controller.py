@@ -1,802 +1,434 @@
 #!/usr/bin/env python3
 """
-COMPLETE FIXED Multi-Vector Models for Brain Passage Retrieval
-FIXES APPLIED:
-1. EEG encoder initialized during __init__ (not during forward pass) ✓
-2. Positional encodings in transformer ✓
-3. True LaBraM-style channel patching (each channel processed independently) ✓
-4. Spatial (channel) embeddings for 10-20 system ✓
-5. Proper parameter registration for optimizer ✓
+FIXED Controller for Brain Passage Retrieval
+CHANGES:
+1. Always passes global_eeg_dims to model creation (fixes EEG encoder initialization)
+2. Adds --use_labram_patching flag for true LaBraM-style channel patching
+3. Adds parameter verification after model creation
 """
 
 import torch
-import torch.nn as nn
-from transformers import AutoModel
-import torch.nn.functional as F
-from peft import LoraConfig, get_peft_model, TaskType
-import math
+import numpy as np
+import random
+import argparse
+from pathlib import Path
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+import json
+from datetime import datetime
+
+# Import our custom modules
+from mv_dataloader import DynamicMaskingDataloader, simple_collate_fn, compute_global_eeg_dimensions
+from mv_models import create_model  # Use FIXED model
+from mv_training import train_model, finish_wandb
 
 
-class LaBramChannelPatcher(nn.Module):
+def set_seeds(seed=42):
+    """Set all random seeds for reproducibility"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    print(f"Set random seed to {seed}")
+
+
+def create_output_directory(base_name="simple_experiment"):
+    """Create timestamped output directory for experiment results"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(f"{base_name}_{timestamp}")
+    output_dir.mkdir(exist_ok=True)
+    print(f"Created output directory: {output_dir}")
+    return output_dir
+
+
+def create_dynamic_dataloaders(data_path, tokenizer, batch_size=8, max_text_len=256,
+                               max_eeg_len=50, train_ratio=0.8, debug=False,
+                               num_vectors=32, dataset_type='auto', training_masking_level=90,
+                               global_eeg_dims=None, split_by_subject=False):
+    """Create training, validation, and test dataloaders with DYNAMIC masking support"""
+    print(f"Loading data from: {data_path}")
+
+    # Compute global EEG dimensions if not provided
+    if global_eeg_dims is None:
+        global_eeg_dims = compute_global_eeg_dimensions(data_path, max_eeg_len, dataset_type)
+        print(f"Computed global EEG dimensions: {global_eeg_dims[0]}x{global_eeg_dims[1]}x{global_eeg_dims[2]}")
+
+    # Convert training masking level to probability
+    training_masking_prob = training_masking_level / 100.0
+    print(f"Training with {training_masking_level}% masking probability")
+
+    # Create datasets
+    train_dataset = DynamicMaskingDataloader(
+        data_path=data_path, tokenizer=tokenizer, max_text_len=max_text_len,
+        max_eeg_len=max_eeg_len, split='train', train_ratio=train_ratio,
+        debug=debug, global_eeg_dims=global_eeg_dims, num_vectors=num_vectors,
+        dataset_type=dataset_type, initial_masking_probability=training_masking_prob
+    )
+    train_dataset.split_by_subject = split_by_subject
+
+    val_dataset = DynamicMaskingDataloader(
+        data_path=data_path, tokenizer=tokenizer, max_text_len=max_text_len,
+        max_eeg_len=max_eeg_len, split='val', train_ratio=train_ratio,
+        debug=debug, global_eeg_dims=global_eeg_dims, num_vectors=num_vectors,
+        dataset_type=dataset_type, initial_masking_probability=training_masking_prob
+    )
+    val_dataset.split_by_subject = split_by_subject
+
+    test_dataset = DynamicMaskingDataloader(
+        data_path=data_path, tokenizer=tokenizer, max_text_len=max_text_len,
+        max_eeg_len=max_eeg_len, split='test', train_ratio=train_ratio,
+        debug=debug, global_eeg_dims=global_eeg_dims, num_vectors=num_vectors,
+        dataset_type=dataset_type, initial_masking_probability=training_masking_prob
+    )
+    test_dataset.split_by_subject = split_by_subject
+
+    # Create dataloaders
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                  collate_fn=simple_collate_fn, num_workers=0,
+                                  pin_memory=torch.cuda.is_available())
+
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                collate_fn=simple_collate_fn, num_workers=0,
+                                pin_memory=torch.cuda.is_available())
+
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                                 collate_fn=simple_collate_fn, num_workers=0,
+                                 pin_memory=torch.cuda.is_available())
+
+    print(f"Created training dataloader with {len(train_dataset)} samples")
+    print(f"Created validation dataloader with {len(val_dataset)} samples")
+    print(f"Created test dataloader with {len(test_dataset)} samples")
+
+    return train_dataloader, val_dataloader, test_dataloader, global_eeg_dims
+
+
+def verify_model_parameters(model):
     """
-    TRUE LaBraM-style patching: processes each EEG channel independently
-    Creates C × T patches (channels × time_patches) where each patch is single-channel
+    Verify that all expected modules are registered and have parameters
+    Returns parameter breakdown by module
     """
+    print("\n=== PARAMETER VERIFICATION ===")
 
-    def __init__(self, patch_length=200, num_channels=64, max_time_patches=50):
-        super().__init__()
-        self.patch_length = patch_length
-        self.num_channels = num_channels
-        self.max_time_patches = max_time_patches
+    param_breakdown = {}
 
-    def forward(self, eeg_input):
-        """
-        Convert EEG to channel-wise patches
+    for name, module in model.named_modules():
+        if len(list(module.parameters())) > 0 and len(list(module.children())) == 0:  # Leaf modules
+            num_params = sum(p.numel() for p in module.parameters())
+            trainable_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            param_breakdown[name] = {
+                'total': num_params,
+                'trainable': trainable_params
+            }
 
-        Args:
-            eeg_input: [batch, num_words, time_samples, channels]
-        Returns:
-            patches: [batch, num_words, channels × time_patches, patch_length]
-            channel_indices: [channels × time_patches] - which channel each patch came from
-            time_indices: [channels × time_patches] - which time window each patch is
-        """
-        batch_size, num_words, time_samples, channels = eeg_input.shape
+    # Print breakdown
+    print("\nParameter breakdown by module:")
+    for name, counts in sorted(param_breakdown.items()):
+        if counts['total'] > 0:
+            trainable_pct = (counts['trainable'] / counts['total'] * 100) if counts['total'] > 0 else 0
+            print(f"  {name}: {counts['total']:,} total, {counts['trainable']:,} trainable ({trainable_pct:.1f}%)")
 
-        # Calculate number of time patches per channel
-        num_time_patches = time_samples // self.patch_length
-
-        all_patches = []
-        channel_indices = []
-        time_indices = []
-
-        for word_idx in range(num_words):
-            word_data = eeg_input[:, word_idx, :, :]  # [batch, time, channels]
-
-            word_patches = []
-
-            # For each channel, create temporal patches
-            for ch_idx in range(channels):
-                channel_data = word_data[:, :, ch_idx]  # [batch, time]
-
-                # Create temporal patches for this channel
-                for t_idx in range(num_time_patches):
-                    start_t = t_idx * self.patch_length
-                    end_t = start_t + self.patch_length
-
-                    if end_t <= time_samples:
-                        patch = channel_data[:, start_t:end_t]  # [batch, patch_length]
-                        word_patches.append(patch.unsqueeze(1))  # [batch, 1, patch_length]
-
-                        if word_idx == 0:  # Only compute indices once
-                            channel_indices.append(ch_idx)
-                            time_indices.append(t_idx)
-
-            # Stack patches for this word: [batch, C×T, patch_length]
-            if len(word_patches) > 0:
-                word_patches_stacked = torch.cat(word_patches, dim=1)
-                all_patches.append(word_patches_stacked)
-
-        # Stack across words: [batch, num_words, C×T, patch_length]
-        patches = torch.stack(all_patches, dim=1)
-
-        # Create index tensors
-        channel_indices = torch.tensor(channel_indices, device=eeg_input.device, dtype=torch.long)
-        time_indices = torch.tensor(time_indices, device=eeg_input.device, dtype=torch.long)
-
-        return patches, channel_indices, time_indices
-
-
-class LaBramCNNPreprocessor(nn.Module):
-    """
-    TRUE LaBraM-style CNN: processes single-channel patches
-    Input: Single-channel patches
-    Output: Hidden dimension features
-    """
-
-    def __init__(self, hidden_dim=768, num_layers=3):
-        super().__init__()
-
-        # CNN layers for single-channel input (input_channels=1)
-        if num_layers == 3:
-            self.cnn_blocks = nn.Sequential(
-                nn.Conv1d(1, hidden_dim // 4, kernel_size=15, stride=8, padding=7),  # 1 input channel!
-                nn.GroupNorm(4, hidden_dim // 4),
-                nn.GELU(),
-                nn.Conv1d(hidden_dim // 4, hidden_dim // 2, kernel_size=3, stride=1, padding=1),
-                nn.GroupNorm(8, hidden_dim // 2),
-                nn.GELU(),
-                nn.Conv1d(hidden_dim // 2, hidden_dim, kernel_size=3, stride=1, padding=1),
-                nn.GroupNorm(16, hidden_dim),
-                nn.GELU()
-            )
-        else:
-            self.cnn_blocks = nn.Sequential(
-                nn.Conv1d(1, hidden_dim, kernel_size=15, stride=8, padding=7),  # 1 input channel!
-                nn.GroupNorm(8, hidden_dim),
-                nn.GELU()
-            )
-
-    def forward(self, x):
-        """
-        Args:
-            x: [batch × num_words × num_patches, patch_length] - flattened single-channel patches
-        Returns:
-            [batch × num_words × num_patches, hidden_dim]
-        """
-        # Add channel dimension: [batch × num_words × num_patches, 1, patch_length]
-        x = x.unsqueeze(1)
-
-        # Apply CNN
-        x = self.cnn_blocks(x)  # [batch × num_words × num_patches, hidden_dim, new_length]
-
-        # Global average pooling over time
-        x = x.mean(dim=2)  # [batch × num_words × num_patches, hidden_dim]
-
-        return x
-
-
-class LaBramPositionalEmbeddings(nn.Module):
-    """
-    LaBraM-style positional embeddings for EEG
-    - Temporal: which time patch within a sequence
-    - Spatial: which channel/electrode (mapped to 10-20 system)
-    - Word: which word in the sequence
-    """
-
-    def __init__(self, hidden_dim, max_words=50, max_time_patches=50, max_channels=128):
-        super().__init__()
-
-        # Learnable embeddings
-        self.temporal_embeddings = nn.Embedding(max_time_patches, hidden_dim)
-        self.spatial_embeddings = nn.Embedding(max_channels, hidden_dim)
-        self.word_embeddings = nn.Embedding(max_words, hidden_dim)
-
-        self.max_words = max_words
-        self.max_time_patches = max_time_patches
-        self.max_channels = max_channels
-
-    def forward(self, patch_features, num_words, channel_indices, time_indices):
-        """
-        Add positional embeddings to patch features
-
-        Args:
-            patch_features: [batch, num_words, C×T, hidden_dim]
-            num_words: number of words
-            channel_indices: [C×T] - which channel each patch came from
-            time_indices: [C×T] - which time window each patch is
-        Returns:
-            [batch, num_words, C×T, hidden_dim] with positional encodings added
-        """
-        batch_size, num_words, num_patches, hidden_dim = patch_features.shape
-
-        # Word embeddings: [batch, num_words, 1, hidden_dim]
-        word_pos = torch.arange(num_words, device=patch_features.device).unsqueeze(0).expand(batch_size, -1)
-        word_emb = self.word_embeddings(word_pos).unsqueeze(2)
-
-        # Spatial embeddings: [1, 1, C×T, hidden_dim]
-        spatial_emb = self.spatial_embeddings(channel_indices).unsqueeze(0).unsqueeze(0)
-
-        # Temporal embeddings: [1, 1, C×T, hidden_dim]
-        temporal_emb = self.temporal_embeddings(time_indices).unsqueeze(0).unsqueeze(0)
-
-        # Add all embeddings
-        return patch_features + word_emb + spatial_emb + temporal_emb
-
-
-class SimpleTextEncoder(nn.Module):
-    """Simple text encoder trained from scratch (similar complexity to EEG encoder)"""
-
-    def __init__(self, vocab_size, hidden_dim=768, arch='simple'):
-        super().__init__()
-        self.arch = arch
-        self.hidden_dim = hidden_dim
-
-        # Embedding layer (trained from scratch)
-        self.embedding = nn.Embedding(vocab_size, hidden_dim, padding_idx=0)
-
-        if arch == 'simple':
-            self.encoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim)
-            )
-        elif arch == 'complex':
-            self.encoder = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.LayerNorm(hidden_dim * 2),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(hidden_dim * 2, hidden_dim)
-            )
-        elif arch == 'transformer':
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=8,
-                dim_feedforward=hidden_dim * 2,
-                dropout=0.1,
-                batch_first=True
-            )
-            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
-
-    def forward(self, input_ids, attention_mask):
-        embedded = self.embedding(input_ids)
-
-        if self.arch == 'transformer':
-            padding_mask = ~attention_mask.bool()
-            encoded = self.encoder(embedded, src_key_padding_mask=padding_mask)
-        else:
-            mask_expanded = attention_mask.unsqueeze(-1).float()
-            pooled = (embedded * mask_expanded).sum(dim=1) / (mask_expanded.sum(dim=1) + 1e-8)
-            encoded = self.encoder(pooled).unsqueeze(1)
-
-        return encoded
-
-
-class SimplifiedBrainRetrieval(nn.Module):
-    """
-    COMPLETE FIXED Brain Retrieval Model with:
-    1. EEG encoder initialized during __init__ (not lazily) ✓
-    2. Positional encodings in transformer ✓
-    3. Optional LaBraM-style channel patching ✓
-    4. Proper parameter registration ✓
-    """
-
-    def __init__(self, colbert_model_name='colbert-ir/colbertv2.0',
-                 hidden_dim=768, eeg_arch='simple', dropout=0.1,
-                 use_lora=True, lora_r=16, lora_alpha=32,
-                 pooling_strategy='multi', query_type='eeg',
-                 use_pretrained_text=True, global_eeg_dims=None,
-                 use_labram_patching=False, labram_patch_length=200):
-        super().__init__()
-
-        self.query_type = query_type
-        self.pooling_strategy = pooling_strategy
-        self.hidden_dim = hidden_dim
-        self.eeg_arch = eeg_arch
-        self.use_lora = use_lora
-        self.use_pretrained_text = use_pretrained_text
-        self.use_labram_patching = use_labram_patching
-
-        # Validate pooling strategy
-        if pooling_strategy not in ['multi', 'cls', 'max', 'mean']:
-            raise ValueError(
-                f"Only 'multi', 'cls', 'max', and 'mean' pooling strategies supported, got: {pooling_strategy}")
-
-        # Text encoder
-        if use_pretrained_text:
-            print(f"Loading pretrained ColBERT model: {colbert_model_name}")
-            try:
-                self.text_encoder = AutoModel.from_pretrained(colbert_model_name)
-            except:
-                print(f"ColBERT model not found, falling back to bert-base-uncased")
-                self.text_encoder = AutoModel.from_pretrained('bert-base-uncased')
-                colbert_model_name = 'bert-base-uncased'
-
-            encoder_dim = self.text_encoder.config.hidden_size
-            self.text_projection = nn.Linear(encoder_dim, hidden_dim)
-
-            if use_lora:
-                print(f"Applying LoRA adaptation with r={lora_r}, alpha={lora_alpha}")
-                lora_config = LoraConfig(
-                    task_type=TaskType.FEATURE_EXTRACTION,
-                    r=lora_r,
-                    lora_alpha=lora_alpha,
-                    lora_dropout=0.1,
-                    target_modules=["query", "key", "value", "dense"]
-                )
-                self.text_encoder = get_peft_model(self.text_encoder, lora_config)
-                print(f"LoRA parameters: {sum(p.numel() for p in self.text_encoder.parameters() if p.requires_grad)}")
+    # Check critical modules
+    critical_modules = ['eeg_encoder', 'text_encoder', 'text_projection', 'eeg_projection']
+    print("\nCritical module check:")
+    for module_name in critical_modules:
+        if hasattr(model, module_name):
+            module = getattr(model, module_name)
+            if module is not None:
+                num_params = sum(p.numel() for p in module.parameters())
+                print(f"  ✓ {module_name}: {num_params:,} parameters")
             else:
-                for param in self.text_encoder.parameters():
-                    param.requires_grad = False
+                print(f"  ✗ {module_name}: None (not initialized!)")
         else:
-            print(f"Using simple text encoder trained from scratch (arch: {eeg_arch})")
-            self.text_encoder = SimpleTextEncoder(
-                vocab_size=30522,
-                hidden_dim=hidden_dim,
-                arch=eeg_arch
-            )
-            encoder_dim = hidden_dim
-            self.text_projection = nn.Identity()
+            print(f"  ✗ {module_name}: Not found")
 
-        # ===== FIX 1: INITIALIZE EEG ENCODER DURING __INIT__ =====
-        if global_eeg_dims is not None and query_type == 'eeg':
-            num_words, time_samples, channels = global_eeg_dims
-            device = next(self.text_projection.parameters()).device if hasattr(self.text_projection,
-                                                                               'weight') else torch.device(
-                'cuda' if torch.cuda.is_available() else 'cpu')
-
-            if use_labram_patching:
-                # ===== FIX 2: LABRAM-STYLE CHANNEL PATCHING =====
-                print(f"✓ Using LaBraM-style channel patching (patch_length={labram_patch_length})")
-
-                # Create patcher
-                self.channel_patcher = LaBramChannelPatcher(
-                    patch_length=labram_patch_length,
-                    num_channels=channels,
-                    max_time_patches=time_samples // labram_patch_length
-                )
-
-                # Create CNN preprocessor (single-channel input)
-                self.cnn_preprocessor = LaBramCNNPreprocessor(
-                    hidden_dim=hidden_dim,
-                    num_layers=3 if eeg_arch != 'simple' else 2
-                )
-
-                # Create positional embeddings
-                self.positional_embeddings = LaBramPositionalEmbeddings(
-                    hidden_dim=hidden_dim,
-                    max_words=num_words,
-                    max_time_patches=time_samples // labram_patch_length,
-                    max_channels=channels
-                )
-
-                # Create transformer to process patches
-                num_patches_per_word = channels * (time_samples // labram_patch_length)
-                self.eeg_encoder = EEGTransformerEncoder(
-                    input_size=hidden_dim,  # Already projected by CNN
-                    hidden_dim=hidden_dim,
-                    num_heads=8,
-                    num_layers=2,
-                    dropout=0.1,
-                    max_seq_len=num_patches_per_word * num_words  # Total patches
-                )
-
-                print(f"  Channel patcher: {channels} channels × {time_samples // labram_patch_length} time patches")
-                print(f"  Total patches per word: {num_patches_per_word}")
-                print(f"  CNN preprocessor: Conv1d(1 → {hidden_dim})")
-                print(f"  Positional embeddings: temporal + spatial + word")
-
+    # Check for LaBraM components if used
+    if hasattr(model, 'use_labram_patching') and model.use_labram_patching:
+        labram_modules = ['channel_patcher', 'cnn_preprocessor', 'positional_embeddings']
+        print("\nLaBraM component check:")
+        for module_name in labram_modules:
+            if hasattr(model, module_name):
+                module = getattr(model, module_name)
+                if module is not None:
+                    num_params = sum(p.numel() for p in module.parameters())
+                    print(f"  ✓ {module_name}: {num_params:,} parameters")
+                else:
+                    print(f"  ✗ {module_name}: None (not initialized!)")
             else:
-                # Standard approach: flatten time×channels
-                input_size = time_samples * channels
-                self.eeg_encoder = self._create_eeg_encoder(input_size, device)
-                print(f"✓ Initialized standard EEG encoder with input size {input_size}")
+                print(f"  ✗ {module_name}: Not found")
 
-                self.channel_patcher = None
-                self.cnn_preprocessor = None
-                self.positional_embeddings = None
-        else:
-            self.eeg_encoder = None
-            self.channel_patcher = None
-            self.cnn_preprocessor = None
-            self.positional_embeddings = None
-            if query_type == 'eeg':
-                raise ValueError("⚠ ERROR: global_eeg_dims MUST be provided for EEG query type!")
-
-        # EEG projection
-        if eeg_arch != 'transformer' and not use_labram_patching:
-            self.eeg_projection = nn.Linear(hidden_dim, hidden_dim)
-        else:
-            self.eeg_projection = nn.Identity()
-
-        # Components for CLS pooling
-        if pooling_strategy == 'cls':
-            self.eeg_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=8,
-                dim_feedforward=hidden_dim * 2,
-                dropout=0.1,
-                activation='relu',
-                batch_first=True
-            )
-            self.eeg_cls_transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
-            print(f"Initialized learnable EEG CLS token: {self.eeg_cls_token.shape}")
-        else:
-            self.eeg_cls_token = None
-            self.eeg_cls_transformer = None
-
-        self.dropout = nn.Dropout(dropout)
-
-        print(f"✓ Model initialized successfully")
-        print(f"  Pooling: {pooling_strategy}, Query type: {query_type}")
-        print(f"  Text encoder: {colbert_model_name if use_pretrained_text else 'SimpleTextEncoder'}")
-        print(f"  EEG encoder: {eeg_arch} ({'LaBraM-style' if use_labram_patching else 'standard'})")
-
-    def set_tokenizer_vocab_size(self, tokenizer_vocab_size):
-        """Update text encoder vocab size after tokenizer is created"""
-        if not self.use_pretrained_text:
-            device = next(self.parameters()).device
-            self.text_encoder.embedding = nn.Embedding(
-                tokenizer_vocab_size,
-                self.hidden_dim,
-                padding_idx=0
-            ).to(device)
-
-    def _create_eeg_encoder(self, input_size, device):
-        """Create EEG encoder based on architecture choice (standard approach)"""
-
-        if self.eeg_arch == 'simple':
-            encoder = nn.Sequential(
-                nn.Linear(input_size, self.hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.ReLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim)
-            )
-        elif self.eeg_arch == 'complex':
-            encoder = nn.Sequential(
-                nn.Linear(input_size, self.hidden_dim),
-                nn.BatchNorm1d(self.hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(self.hidden_dim, self.hidden_dim * 2),
-                nn.BatchNorm1d(self.hidden_dim * 2),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(self.hidden_dim * 2, self.hidden_dim)
-            )
-        elif self.eeg_arch == 'transformer':
-            encoder = EEGTransformerEncoder(
-                input_size=input_size,
-                hidden_dim=self.hidden_dim,
-                num_heads=4,
-                num_layers=1,
-                dropout=0.3,
-                max_seq_len=50
-            )
-        else:
-            raise ValueError(f"Unknown EEG architecture: {self.eeg_arch}")
-
-        return encoder.to(device)
-
-    def encode_text(self, input_ids, attention_mask):
-        """Encode text with pooling strategy"""
-
-        if self.use_pretrained_text:
-            if self.use_lora:
-                outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-                hidden_states = outputs.last_hidden_state
-            else:
-                with torch.no_grad():
-                    outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-                    hidden_states = outputs.last_hidden_state
-        else:
-            hidden_states = self.text_encoder(input_ids, attention_mask)
-
-        projected = self.text_projection(hidden_states)
-        projected = self.dropout(projected)
-
-        batch_size = input_ids.size(0)
-
-        if self.pooling_strategy == 'multi':
-            multi_vectors = []
-            for i in range(batch_size):
-                valid_positions = torch.where(attention_mask[i] == 1)[0][1:]
-                if len(valid_positions) > 0:
-                    sample_vectors = projected[i, valid_positions]
-                else:
-                    sample_vectors = torch.zeros(1, projected.size(-1), device=projected.device)
-                multi_vectors.append(sample_vectors)
-            return multi_vectors
-
-        elif self.pooling_strategy == 'max':
-            max_vectors = []
-            for i in range(batch_size):
-                valid_mask = attention_mask[i] == 1
-                if valid_mask.sum() > 0:
-                    max_vector = torch.max(projected[i, valid_mask], dim=0)[0]
-                else:
-                    max_vector = torch.zeros(projected.size(-1), device=projected.device)
-                max_vectors.append(max_vector.unsqueeze(0))
-            return torch.stack(max_vectors)
-
-        elif self.pooling_strategy == 'mean':
-            mean_vectors = []
-            for i in range(batch_size):
-                valid_mask = attention_mask[i] == 1
-                if valid_mask.sum() > 0:
-                    mean_vector = torch.mean(projected[i, valid_mask], dim=0)
-                else:
-                    mean_vector = torch.zeros(projected.size(-1), device=projected.device)
-                mean_vectors.append(mean_vector.unsqueeze(0))
-            return torch.stack(mean_vectors)
-
-        elif self.pooling_strategy == 'cls':
-            return projected[:, 0:1, :]
-
-    def encode_eeg(self, eeg_input, eeg_mv_mask):
-        """
-        Encode EEG with either standard or LaBraM-style approach
-
-        Args:
-            eeg_input: [batch, num_words, time_samples, channels]
-            eeg_mv_mask: mask for multi-vector
-        """
-        batch_size, num_words, time_samples, channels = eeg_input.shape
-
-        # Compute padding mask
-        eeg_padding_mask = (eeg_input.abs().sum(dim=(2, 3)) == 0)  # [batch, num_words]
-
-        if self.use_labram_patching:
-            # ===== LABRAM-STYLE PROCESSING =====
-            # Step 1: Create channel-wise patches
-            patches, channel_indices, time_indices = self.channel_patcher(eeg_input)
-            # patches: [batch, num_words, C×T, patch_length]
-
-            # Step 2: Flatten for CNN processing
-            batch_size, num_words, num_patches, patch_length = patches.shape
-            patches_flat = patches.view(batch_size * num_words * num_patches, patch_length)
-
-            # Step 3: Apply CNN to each single-channel patch
-            patch_features = self.cnn_preprocessor(patches_flat)
-            patch_features = patch_features.view(batch_size, num_words, num_patches, self.hidden_dim)
-
-            # Step 4: Add positional embeddings (temporal + spatial + word)
-            patch_features = self.positional_embeddings(
-                patch_features,
-                num_words=num_words,
-                channel_indices=channel_indices,
-                time_indices=time_indices
-            )
-
-            # Step 5: Flatten words and patches for transformer
-            patch_features_flat = patch_features.view(batch_size, num_words * num_patches, self.hidden_dim)
-
-            # Create padding mask for patches
-            patch_padding_mask = eeg_padding_mask.unsqueeze(2).expand(-1, -1, num_patches).reshape(batch_size, -1)
-
-            # Step 6: Apply transformer
-            word_representations = self.eeg_encoder(patch_features_flat, padding_mask=patch_padding_mask)
-
-            # Step 7: Reshape back to word-level (average patches within each word)
-            word_representations = word_representations.view(batch_size, num_words, num_patches, self.hidden_dim)
-            word_representations = word_representations.mean(dim=2)  # [batch, num_words, hidden_dim]
-
-        else:
-            # Standard approach: flatten time×channels
-            input_size = time_samples * channels
-
-            if self.eeg_arch == 'transformer':
-                eeg_reshaped = eeg_input.view(batch_size, num_words, input_size)
-                word_representations = self.eeg_encoder(eeg_reshaped, padding_mask=eeg_padding_mask)
-            else:
-                eeg_flat = eeg_input.view(batch_size * num_words, input_size)
-                encoded = self.eeg_encoder(eeg_flat)
-                word_representations = encoded.view(batch_size, num_words, self.hidden_dim)
-
-        # Apply projection and dropout
-        word_representations = self.eeg_projection(word_representations)
-        word_representations = self.dropout(word_representations)
-
-        # Apply pooling strategy
-        if self.pooling_strategy == 'multi':
-            multi_vectors = []
-            for i in range(batch_size):
-                active_positions = torch.where(~eeg_padding_mask[i])[0]
-                if len(active_positions) > 0:
-                    sample_vectors = word_representations[i, active_positions]
-                else:
-                    sample_vectors = torch.zeros(1, self.hidden_dim, device=eeg_input.device)
-                multi_vectors.append(sample_vectors)
-            return multi_vectors
-
-        elif self.pooling_strategy == 'max':
-            max_vectors = []
-            for i in range(batch_size):
-                active_positions = torch.where(~eeg_padding_mask[i])[0]
-                if len(active_positions) > 0:
-                    max_vector = torch.max(word_representations[i, active_positions], dim=0)[0]
-                else:
-                    max_vector = torch.zeros(self.hidden_dim, device=eeg_input.device)
-                max_vectors.append(max_vector.unsqueeze(0))
-            return torch.stack(max_vectors)
-
-        elif self.pooling_strategy == 'mean':
-            mean_vectors = []
-            for i in range(batch_size):
-                active_positions = torch.where(~eeg_padding_mask[i])[0]
-                if len(active_positions) > 0:
-                    mean_vector = torch.mean(word_representations[i, active_positions], dim=0)
-                else:
-                    mean_vector = torch.zeros(self.hidden_dim, device=eeg_input.device)
-                mean_vectors.append(mean_vector.unsqueeze(0))
-            return torch.stack(mean_vectors)
-
-        elif self.pooling_strategy == 'cls':
-            cls_tokens = self.eeg_cls_token.expand(batch_size, -1, -1)
-            cls_word_sequence = torch.cat([cls_tokens, word_representations], dim=1)
-            cls_mask = torch.zeros(batch_size, 1, device=eeg_input.device, dtype=torch.bool)
-            full_mask = torch.cat([cls_mask, eeg_padding_mask], dim=1)
-            attended_sequence = self.eeg_cls_transformer(cls_word_sequence, src_key_padding_mask=full_mask)
-            return attended_sequence[:, 0:1, :]
-
-    def forward(self, eeg_queries, text_queries, docs, eeg_mv_masks):
-        """Complete forward pass"""
-
-        doc_vectors = self.encode_text(docs['input_ids'], docs['attention_mask'])
-
-        if self.query_type == 'eeg':
-            query_vectors = self.encode_eeg(eeg_queries, eeg_mv_masks)
-        else:
-            query_vectors = self.encode_text(text_queries['input_ids'], text_queries['attention_mask'])
-
-        return {
-            'query_vectors': query_vectors,
-            'doc_vectors': doc_vectors,
-            'eeg_vectors': None if self.query_type == 'text' else query_vectors
-        }
+    return param_breakdown
 
 
-class EEGTransformerEncoder(nn.Module):
-    """
-    FIXED Transformer encoder with positional encodings
-    """
+def save_experiment_config(config, output_dir):
+    """Save experiment configuration to JSON file"""
+    config_path = output_dir / "experiment_config.json"
 
-    def __init__(self, input_size, hidden_dim=768, num_heads=4, num_layers=1,
-                 dropout=0.3, max_seq_len=50):
-        super().__init__()
+    # Convert non-serializable values
+    serializable_config = {k: (v if isinstance(v, (str, int, float, bool, list, dict, type(None))) else str(v))
+                           for k, v in config.items()}
 
-        self.hidden_dim = hidden_dim
-        self.max_seq_len = max_seq_len
+    with open(config_path, 'w') as f:
+        json.dump(serializable_config, f, indent=2)
+    print(f"Saved experiment config to: {config_path}")
 
-        # Input projection
-        if input_size != hidden_dim:
-            self.input_projection = nn.Linear(input_size, hidden_dim)
-        else:
-            self.input_projection = nn.Identity()
 
-        # Learnable positional encodings
-        self.positional_encoding = nn.Embedding(max_seq_len, hidden_dim)
+def main():
+    parser = argparse.ArgumentParser(
+        description='FIXED Brain Passage Retrieval with proper EEG encoder initialization')
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True
+    # Data arguments
+    parser.add_argument('--data_paths', nargs='+', help='Paths to ICT pairs .npy files (can specify multiple)')
+    parser.add_argument('--dataset_types', nargs='+', default=['auto'],
+                        choices=['auto', 'original', 'nieuwland', 'alice', 'derco', 'narrative'],
+                        help='Dataset types (one for each data_path)')
+
+    # Model arguments
+    parser.add_argument('--colbert_model_name', default='colbert-ir/colbertv2.0', help='ColBERT model name')
+    parser.add_argument('--hidden_dim', type=int, default=768, help='Hidden dimension size')
+    parser.add_argument('--pooling_strategy', default='max', choices=['multi', 'cls', 'max', 'mean'],
+                        help='Pooling strategy')
+    parser.add_argument('--encoder_type', default='dual', choices=['dual'],
+                        help='Encoder type (only dual supported in fixed version)')
+    parser.add_argument('--query_type', default='eeg', choices=['eeg', 'text'],
+                        help='Query representation type')
+
+    # LoRA arguments
+    parser.add_argument('--no_lora', action='store_true', help='Disable LoRA adaptation')
+    parser.add_argument('--lora_r', type=int, default=16, help='LoRA rank')
+    parser.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha scaling factor')
+    parser.add_argument('--use_pretrained_text', action='store_true',
+                        help='Use pretrained ColBERT for text encoding')
+
+    # Training arguments
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--max_text_len', type=int, default=256, help='Max text sequence length')
+    parser.add_argument('--max_eeg_len', type=int, default=50, help='Max EEG sequence length')
+    parser.add_argument('--train_ratio', type=float, default=0.8, help='Ratio of data for training')
+    parser.add_argument('--eeg_arch', default='transformer', choices=['simple', 'complex', 'transformer'],
+                        help='EEG encoder architecture')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
+
+    # NEW: LaBraM patching arguments
+    parser.add_argument('--use_labram_patching', action='store_true',
+                        help='Use LaBraM-style channel patching (each channel processed independently)')
+    parser.add_argument('--labram_patch_length', type=int, default=200,
+                        help='Length of temporal patches for LaBraM (default: 200 samples)')
+
+    # Multi-masking validation arguments
+    parser.add_argument('--enable_multi_masking_validation', action='store_true',
+                        help='Enable validation across multiple masking levels')
+    parser.add_argument('--validation_masking_levels', nargs='+', type=int,
+                        default=[0, 25, 50, 75, 90, 100],
+                        help='Masking percentages for validation')
+    parser.add_argument('--multi_masking_frequency', type=int, default=3,
+                        help='Run multi-masking validation every N epochs')
+    parser.add_argument('--primary_masking_level', type=int, default=90,
+                        help='Primary masking level for early stopping')
+    parser.add_argument('--training_masking_level', type=int, default=90,
+                        help='Masking level used during training')
+
+    # Test evaluation arguments
+    parser.add_argument('--test_masking_levels', nargs='+', type=int,
+                        default=[0, 25, 50, 75, 90, 100],
+                        help='Masking percentages for testing')
+    parser.add_argument('--enable_test_evaluation', action='store_true',
+                        help='Enable comprehensive test evaluation after training')
+
+    # Experiment arguments
+    parser.add_argument('--output_dir', default=None, help='Output directory')
+    parser.add_argument('--debug', action='store_true', help='Enable debug prints')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--split_by_subject', action='store_true',
+                        help='Split data by subject (out-of-subject evaluation)')
+
+    args = parser.parse_args()
+
+    # Validate inputs
+    if not args.data_paths:
+        raise ValueError("Must specify --data_paths")
+
+    # Set seeds
+    set_seeds(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Create output directory
+    output_dir = Path(args.output_dir) if args.output_dir else create_output_directory("fixed_brain_retrieval")
+    output_dir.mkdir(exist_ok=True)
+
+    # Load tokenizer
+    print(f"\nLoading tokenizer: {args.colbert_model_name}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.colbert_model_name)
+    except:
+        print(f"ColBERT tokenizer not found, falling back to bert-base-uncased")
+        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+
+    special_tokens = ['[Q]', '[D]', '[MASK]'] if '[MASK]' not in tokenizer.get_vocab() else ['[Q]', '[D]']
+    tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
+    print(f"Tokenizer vocabulary size: {len(tokenizer)}")
+
+    # Create dataloaders with global_eeg_dims
+    print(f"\nCreating dataloaders...")
+    train_dataloader, val_dataloader, test_dataloader, global_eeg_dims = create_dynamic_dataloaders(
+        data_path=args.data_paths,  # Pass list of paths
+        tokenizer=tokenizer, batch_size=args.batch_size,
+        max_text_len=args.max_text_len, max_eeg_len=args.max_eeg_len,
+        train_ratio=args.train_ratio, debug=args.debug,
+        dataset_type=args.dataset_types,  # Pass list of types
+        training_masking_level=args.training_masking_level,
+        split_by_subject=args.split_by_subject
+    )
+
+    print(f"\n✓ Global EEG dimensions: {global_eeg_dims}")
+    print(f"  Words: {global_eeg_dims[0]}, Time: {global_eeg_dims[1]}, Channels: {global_eeg_dims[2]}")
+
+    # Create experiment configuration
+    config = {
+        'experiment_type': 'fixed_brain_retrieval',
+        'timestamp': datetime.now().isoformat(),
+        'data_paths': [str(p) for p in args.data_paths],
+        'dataset_types': args.dataset_types,
+        'colbert_model_name': args.colbert_model_name,
+        'hidden_dim': args.hidden_dim,
+        'batch_size': args.batch_size,
+        'max_text_len': args.max_text_len,
+        'max_eeg_len': args.max_eeg_len,
+        'train_ratio': args.train_ratio,
+        'seed': args.seed,
+        'device': str(device),
+        'tokenizer_vocab_size': len(tokenizer),
+        'train_samples': len(train_dataloader.dataset),
+        'val_samples': len(val_dataloader.dataset),
+        'test_samples': len(test_dataloader.dataset),
+        'eeg_arch': args.eeg_arch,
+        'learning_rate': args.lr,
+        'epochs': args.epochs,
+        'patience': args.patience,
+        'use_lora': not args.no_lora,
+        'lora_r': args.lora_r,
+        'lora_alpha': args.lora_alpha,
+        'pooling_strategy': args.pooling_strategy,
+        'encoder_type': args.encoder_type,
+        'query_type': args.query_type,
+        'use_pretrained_text': args.use_pretrained_text,
+        'use_labram_patching': args.use_labram_patching,
+        'labram_patch_length': args.labram_patch_length,
+        'global_eeg_dims': list(global_eeg_dims),
+        'training_masking_level': args.training_masking_level,
+        'split_by_subject': args.split_by_subject
+    }
+
+    # ===== FIX: CREATE MODEL WITH GLOBAL_EEG_DIMS =====
+    print(f"\n=== MODEL CREATION (FIXED) ===")
+    print(f"Creating model with global_eeg_dims: {global_eeg_dims}")
+
+    if args.use_labram_patching:
+        print(
+            f"⚠ WARNING: LaBraM patching will create {global_eeg_dims[2] * (global_eeg_dims[1] // args.labram_patch_length)} patches per word")
+        print(f"  This is {global_eeg_dims[2]}x more expensive than standard approach!")
+        print(f"  Inference will be MUCH slower. Consider using smaller models or efficient attention.")
+
+    model = create_model(
+        colbert_model_name=args.colbert_model_name,
+        hidden_dim=args.hidden_dim,
+        eeg_arch=args.eeg_arch,
+        device=device,
+        use_lora=not args.no_lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        pooling_strategy=args.pooling_strategy,
+        encoder_type=args.encoder_type,
+        global_eeg_dims=global_eeg_dims,  # ✓ CRITICAL: Pass dimensions
+        query_type=args.query_type,
+        use_pretrained_text=args.use_pretrained_text,
+        use_labram_patching=args.use_labram_patching,  # ✓ NEW: LaBraM patching
+        labram_patch_length=args.labram_patch_length  # ✓ NEW: Patch length
+    )
+
+    if not args.use_pretrained_text:
+        model.set_tokenizer_vocab_size(len(tokenizer))
+
+    # ===== FIX: VERIFY PARAMETERS BEFORE OPTIMIZER =====
+    param_breakdown = verify_model_parameters(model)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n✓ Model created successfully")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    print(f"  Trainable percentage: {trainable_params / total_params * 100:.1f}%")
+
+    config.update({
+        'total_params': total_params,
+        'trainable_params': trainable_params,
+        'param_breakdown': {k: v['total'] for k, v in param_breakdown.items()}
+    })
+    save_experiment_config(config, output_dir)
+
+    # ===== CREATE OPTIMIZER AFTER MODEL IS FULLY INITIALIZED =====
+    print(f"\n=== OPTIMIZER CREATION ===")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    # Verify optimizer has parameters
+    optimizer_param_count = sum(p.numel() for group in optimizer.param_groups for p in group['params'])
+    print(f"✓ Optimizer created with {optimizer_param_count:,} parameters")
+
+    if optimizer_param_count != trainable_params:
+        print(
+            f"⚠ WARNING: Optimizer parameter count ({optimizer_param_count:,}) != trainable params ({trainable_params:,})")
+        print(f"  Some parameters may not be training!")
+    else:
+        print(f"✓ All trainable parameters registered in optimizer")
+
+    # TRAIN
+    print(f"\n=== TRAINING START ===")
+    trained_model = train_model(
+        model=model,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        optimizer=optimizer,
+        num_epochs=args.epochs,
+        patience=args.patience,
+        device=device,
+        debug=args.debug,
+        config=config,
+        enable_multi_masking_validation=args.enable_multi_masking_validation,
+        multi_masking_frequency=args.multi_masking_frequency,
+        validation_masking_levels=args.validation_masking_levels,
+        primary_masking_level=args.primary_masking_level
+    )
+
+    # SAVE MODEL
+    model_save_path = output_dir / f"fixed_model_{args.pooling_strategy}_{args.eeg_arch}.pt"
+    torch.save({
+        'model_state_dict': trained_model.state_dict(),
+        'config': config,
+        'tokenizer_vocab_size': len(tokenizer)
+    }, model_save_path)
+    print(f"Saved trained model to: {model_save_path}")
+
+    # TEST EVALUATION
+    if args.enable_test_evaluation:
+        print(f"\n=== TEST SET EVALUATION ===")
+        from mv_training import test_model
+        test_results = test_model(
+            model=trained_model,
+            test_dataloader=test_dataloader,
+            device=device,
+            debug=args.debug,
+            test_masking_levels=args.test_masking_levels,
+            primary_masking_level=args.primary_masking_level
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        print(f"Test evaluation completed. Results logged to wandb.")
 
-        self.output_projection = nn.Linear(hidden_dim, hidden_dim)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        print(f"✓ EEGTransformerEncoder: {num_layers} layers, {num_heads} heads, dropout={dropout}")
-        print(f"  Positional encoding: learnable, max_len={max_seq_len}")
-
-    def forward(self, x, padding_mask=None):
-        """
-        Args:
-            x: [batch, seq_len, input_size]
-            padding_mask: [batch, seq_len] - True = padded
-        Returns:
-            [batch, seq_len, hidden_dim]
-        """
-        batch_size, seq_len, _ = x.shape
-
-        # Project input
-        x = self.input_projection(x)
-
-        # Add positional encodings
-        positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        positions = torch.clamp(positions, max=self.max_seq_len - 1)  # Clamp to max
-        pos_encodings = self.positional_encoding(positions)
-        x = x + pos_encodings
-        x = self.dropout(x)
-
-        # Create padding mask if not provided
-        if padding_mask is None:
-            padding_mask = (x.abs().sum(dim=-1) == 0)
-
-        # Apply transformer
-        x = self.transformer(x, src_key_padding_mask=padding_mask)
-
-        # Final projection
-        x = self.output_projection(x)
-        x = self.layer_norm(x)
-        x = self.dropout(x)
-
-        return x
+    finish_wandb()
+    print(f"\n=== TRAINING COMPLETE ===")
+    print(f"Results saved in: {output_dir}")
 
 
-def compute_similarity(query_vectors, doc_vectors, pooling_strategy, temperature=1.0):
-    """Compute similarity based on pooling strategy"""
-
-    if pooling_strategy == 'multi':
-        return compute_multi_vector_similarity(query_vectors, doc_vectors, temperature)
-    elif pooling_strategy in ['cls', 'max', 'mean']:
-        return compute_cls_similarity(query_vectors, doc_vectors, temperature)
-    else:
-        raise ValueError(f"Unknown pooling strategy: {pooling_strategy}")
-
-
-def compute_multi_vector_similarity(query_vectors, doc_vectors, temperature=1.0):
-    """Compute ColBERT-style MaxSim similarity"""
-
-    if isinstance(query_vectors, list):
-        similarities = []
-
-        for i in range(len(query_vectors)):
-            q_vecs = query_vectors[i]
-            d_vecs = doc_vectors[i]
-
-            q_vecs = F.normalize(q_vecs, p=2, dim=1)
-            d_vecs = F.normalize(d_vecs, p=2, dim=1)
-
-            q_nonzero = q_vecs[q_vecs.norm(dim=1) > 1e-6]
-            d_nonzero = d_vecs[d_vecs.norm(dim=1) > 1e-6]
-
-            if len(q_nonzero) == 0 or len(d_nonzero) == 0:
-                similarities.append(torch.tensor(0.0, device=q_vecs.device))
-                continue
-
-            sim_matrix = torch.matmul(q_nonzero, d_nonzero.t())
-            max_sims = sim_matrix.max(dim=1)[0]
-            sim = max_sims.sum()
-            similarities.append(sim)
-
-        return torch.stack(similarities) / temperature
-    else:
-        raise ValueError("Multi-vector similarity requires list input")
-
-
-def compute_cls_similarity(query_vectors, doc_vectors, temperature=1.0):
-    """Compute cosine similarity for single vectors"""
-
-    if isinstance(query_vectors, list):
-        similarities = []
-        for i in range(len(query_vectors)):
-            q_vec = query_vectors[i].squeeze()
-            d_vec = doc_vectors[i].squeeze()
-            q_norm = F.normalize(q_vec, p=2, dim=0)
-            d_norm = F.normalize(d_vec, p=2, dim=0)
-            sim = torch.dot(q_norm, d_norm)
-            similarities.append(sim)
-        return torch.stack(similarities) / temperature
-    else:
-        batch_size = query_vectors.size(0)
-        similarities = []
-        for i in range(batch_size):
-            q_vec = query_vectors[i].squeeze()
-            d_vec = doc_vectors[i].squeeze()
-            q_norm = F.normalize(q_vec, p=2, dim=0)
-            d_norm = F.normalize(d_vec, p=2, dim=0)
-            sim = torch.dot(q_norm, d_norm)
-            similarities.append(sim)
-        return torch.stack(similarities) / temperature
-
-
-def create_model(colbert_model_name='colbert-ir/colbertv2.0', hidden_dim=768,
-                 eeg_arch='simple', device='cuda', use_lora=True, lora_r=16,
-                 lora_alpha=32, pooling_strategy='multi', encoder_type='dual',
-                 global_eeg_dims=None, query_type='eeg',
-                 use_pretrained_text=True, use_labram_patching=False,
-                 labram_patch_length=200):
-    """
-    Create model with ALL FIXES:
-    1. EEG encoder initialized during __init__ ✓
-    2. Positional encodings ✓
-    3. Optional LaBraM-style channel patching ✓
-    4. Proper parameter registration ✓
-    """
-
-    if encoder_type == 'dual':
-        model = SimplifiedBrainRetrieval(
-            colbert_model_name=colbert_model_name,
-            hidden_dim=hidden_dim,
-            eeg_arch=eeg_arch,
-            use_lora=use_lora,
-            lora_r=lora_r,
-            lora_alpha=lora_alpha,
-            pooling_strategy=pooling_strategy,
-            query_type=query_type,
-            use_pretrained_text=use_pretrained_text,
-            global_eeg_dims=global_eeg_dims,
-            use_labram_patching=use_labram_patching,
-            labram_patch_length=labram_patch_length
-        )
-    else:
-        raise NotImplementedError("Only dual encoder supported in this fixed version")
-
-    return model.to(device)
+if __name__ == "__main__":
+    main()
