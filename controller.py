@@ -47,12 +47,52 @@ def create_dynamic_dataloaders(data_path, tokenizer, batch_size=8, max_text_len=
                                num_vectors=32, dataset_type='auto', training_masking_level=90,
                                global_eeg_dims=None, split_by_subject=False):
     """Create training, validation, and test dataloaders with DYNAMIC masking support"""
+    # Handle multiple datasets
+    if isinstance(data_path, list):
+        print(f"Loading {len(data_path)} datasets for combination...")
+        # Use first path as reference for computing dimensions if needed
+        reference_path = data_path[0]
+        reference_type = dataset_type[0] if isinstance(dataset_type, list) else dataset_type
+    else:
+        reference_path = data_path
+        reference_type = dataset_type
+
     print(f"Loading data from: {data_path}")
 
-    # Compute global EEG dimensions if not provided
+    # Compute global EEG dimensions if not provided (use first dataset as reference)
     if global_eeg_dims is None:
-        global_eeg_dims = compute_global_eeg_dimensions(data_path, max_eeg_len, dataset_type)
+        global_eeg_dims = compute_global_eeg_dimensions(reference_path, max_eeg_len, reference_type)
         print(f"Computed global EEG dimensions: {global_eeg_dims[0]}x{global_eeg_dims[1]}x{global_eeg_dims[2]}")
+
+    # Combine datasets if multiple paths provided
+    if isinstance(data_path, list) and len(data_path) > 1:
+        from mv_dataloader import load_combined_datasets
+        import tempfile
+
+        print(f"Combining {len(data_path)} datasets...")
+        combined_ict_pairs, combined_metadata = load_combined_datasets(data_path,
+                                                                       dataset_type if isinstance(dataset_type,
+                                                                                                  list) else [
+                                                                                                                 dataset_type] * len(
+                                                                           data_path))
+
+        # Save combined dataset to temp file
+        combined_dataset = {
+            'ict_pairs': combined_ict_pairs,
+            'metadata': combined_metadata
+        }
+        temp_file = tempfile.NamedTemporaryFile(mode='wb', suffix='.npy', delete=False)
+        import numpy as np
+        np.save(temp_file.name, combined_dataset)
+        temp_file.close()
+        data_path = temp_file.name
+        dataset_type = 'auto'  # Combined format is auto-detected
+        print(f"Combined dataset saved to: {data_path}")
+        print(f"Total combined pairs: {len(combined_ict_pairs)}")
+    elif isinstance(data_path, list):
+        # Single path in list
+        data_path = data_path[0]
+        dataset_type = dataset_type[0] if isinstance(dataset_type, list) else dataset_type
 
     # Convert training masking level to probability
     training_masking_prob = training_masking_level / 100.0
