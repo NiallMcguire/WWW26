@@ -5,18 +5,18 @@
 #SBATCH --time=20:00:00
 #SBATCH --mail-user=niall.mcguire@strath.ac.uk
 #SBATCH --mail-type=END
-#SBATCH --job-name=stbpr_4datasets_max
-#SBATCH --output=slurm-stbpr-4datasets-max-%j.out
+#SBATCH --job-name=stbpr_sequence
+#SBATCH --output=slurm-stbpr-%j.out
 
 module purge
 module load nvidia/sdk/23.3
 module load anaconda/python-3.9.7/2021.11
 
-# Run with all 4 datasets: Nieuwland (visual) + Alice (auditory) + DERCo (visual) + Narrative (auditory)
-# Using MAX pooling for spatial-temporal decomposition
+# ST-BPR Sequence (Your Method)
 python controller.py \
-  --data_paths /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
-               /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
+  --data_paths \
+    /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
+    /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
   --dataset_types nieuwland alice \
   --decomp_level sequence \
   --pooling_strategy cls \
