@@ -211,6 +211,18 @@ def main():
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
 
+    # ST-BPR arguments (spatial-temporal decomposition)
+    parser.add_argument('--use_temporal_spatial_decomp', action='store_true',
+                        help='Enable spatial-temporal decomposition (ST-BPR)')
+    parser.add_argument('--decomp_level', default='sequence', choices=['word', 'sequence'],
+                        help='Level of spatial-temporal decomposition')
+    parser.add_argument('--eeg_spatial_temporal_pooling', default='max', choices=['max', 'mean', 'cls'],
+                        help='Pooling strategy for spatial-temporal dimensions')
+    parser.add_argument('--use_sequence_concat', action='store_true',
+                        help='Use sequence concatenation (baseline approach)')
+    parser.add_argument('--use_cnn_preprocessing', action='store_true',
+                        help='Use CNN preprocessing before transformer')
+
     # NEW: LaBraM patching arguments
     parser.add_argument('--use_labram_patching', action='store_true',
                         help='Use LaBraM-style channel patching (each channel processed independently)')
