@@ -616,9 +616,9 @@ class SimplifiedBrainRetrieval(nn.Module):
             elif self.use_temporal_spatial_decomp:
                 num_layers = 2
             elif self.pooling_strategy == 'cls':
-                num_layers = 2
+                num_layers = 3
             else:
-                num_layers = 2
+                num_layers = 4
 
             encoder = EEGTransformerEncoder(effective_input_size, target_hidden_dim, num_layers=num_layers)
             print(f"Created transformer with {num_layers} layers (hidden_dim={target_hidden_dim})")
@@ -726,12 +726,19 @@ class SimplifiedBrainRetrieval(nn.Module):
         patch_features = self.cnn_preprocessor(patches_flat).reshape(batch_size, num_words, num_patches,
                                                                      self.hidden_dim)
 
+        # ch_idx and t_idx are [num_patches] for one word only
+        # Repeat them for all words to match the full sequence
+        ch_idx_all = ch_idx.repeat(num_words)  # [num_words * num_patches]
+        t_idx_all = t_idx.repeat(num_words)  # [num_words * num_patches]
+
         word_indices = torch.arange(num_words, device=eeg_input.device).unsqueeze(0).unsqueeze(2).expand(batch_size,
                                                                                                          num_words,
                                                                                                          num_patches).reshape(
             batch_size, num_words * num_patches)
-        pos_emb = self.labram_pos_embeddings(ch_idx, t_idx, word_indices).reshape(batch_size, num_words, num_patches,
-                                                                                  self.hidden_dim)
+        pos_emb = self.labram_pos_embeddings(ch_idx_all, t_idx_all, word_indices).reshape(batch_size, num_words,
+                                                                                          num_patches,
+                                                                                          self.hidden_dim)
+
         patch_features = patch_features + pos_emb
 
         if self.use_sequence_concat:
