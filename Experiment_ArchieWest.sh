@@ -20,9 +20,6 @@ python controller.py \
     /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
   --dataset_types nieuwland alice \
-  --use_temporal_spatial_decomp \
-  --decomp_level word \
-  --eeg_spatial_temporal_pooling max \
   --pooling_strategy cls \
   --query_type eeg \
   --no_lora \
@@ -32,5 +29,4 @@ python controller.py \
   --enable_multi_masking_validation --validation_masking_levels 90 \
   --multi_masking_frequency 50 --primary_masking_level 90 --training_masking_level 90 \
   --enable_test_evaluation --test_masking_levels 0 25 50 75 90 100
-
 /opt/software/scripts/job_epilogue.sh
