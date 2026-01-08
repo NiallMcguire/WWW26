@@ -295,9 +295,11 @@ class SimplifiedBrainRetrieval(nn.Module):
         print(f"EEG spatial-temporal pooling: {eeg_spatial_temporal_pooling}")
 
         # Create separate encoders for temporal/spatial if needed
+        # ✅ FIXED: Use ModuleDict to track dynamically created encoders
+        self.dynamic_encoders = nn.ModuleDict()
+
         if use_temporal_spatial_decomp:
-            self.temporal_eeg_encoder = None
-            self.spatial_eeg_encoder = None
+            # Encoders will be created on first forward pass and stored in dynamic_encoders
 
             # Calculate hidden dimension for ablation modes to match parameters
             if ablation_mode != 'none' and ablation_match_params:
@@ -325,9 +327,7 @@ class SimplifiedBrainRetrieval(nn.Module):
                 self.combined_projection = None
 
         if use_cnn_preprocessing:
-            self.labram_patcher = None
-            self.cnn_preprocessor = None
-            self.labram_pos_embeddings = None
+            # ✅ FIXED: Will be created on first forward pass and stored in dynamic_encoders
             print(f"TRUE LaBraM-style CNN preprocessing enabled")
         # Validate decomposition settings
         if use_temporal_spatial_decomp and query_type != 'eeg':
@@ -565,18 +565,23 @@ class SimplifiedBrainRetrieval(nn.Module):
 
         if self.use_cnn_preprocessing and not is_cnn_preprocessed:
             # CNN preprocessing path
+            # ✅ FIXED: Store in dynamic_encoders if needed
             if isinstance(input_size, tuple):
                 time_samples, channels = input_size
 
-                self.cnn_preprocessor = LaBramCNNPreprocessor(
-                    input_dim=channels,
-                    hidden_dim=target_hidden_dim,  # Use target dimension
-                    num_layers=2 if self.eeg_arch == 'simple' else 3
-                ).to(device)
+                if 'cnn_preprocessor_alt' not in self.dynamic_encoders:
+                    cnn_prep = LaBramCNNPreprocessor(
+                        input_dim=channels,
+                        hidden_dim=target_hidden_dim,  # Use target dimension
+                        num_layers=2 if self.eeg_arch == 'simple' else 3
+                    ).to(device)
 
-                self.positional_embeddings = EEGPositionalEmbeddings(
-                    hidden_dim=target_hidden_dim  # Use target dimension
-                ).to(device)
+                    pos_emb = EEGPositionalEmbeddings(
+                        hidden_dim=target_hidden_dim  # Use target dimension
+                    ).to(device)
+
+                    self.dynamic_encoders['cnn_preprocessor_alt'] = cnn_prep
+                    self.dynamic_encoders['positional_embeddings_alt'] = pos_emb
 
                 effective_input_size = target_hidden_dim
             else:
@@ -649,7 +654,8 @@ class SimplifiedBrainRetrieval(nn.Module):
                 batch_patches = patches.reshape(batch_size * num_time_patches, patch_length, channels)
 
                 # Single CNN forward pass for ALL patches (with all channels)
-                batch_embeddings = self.cnn_preprocessor(batch_patches)  # [total_patches, new_time, hidden_dim]
+                batch_embeddings = self.dynamic_encoders['cnn_preprocessor'](
+                    batch_patches)  # [total_patches, new_time, hidden_dim]
                 batch_embeddings = torch.mean(batch_embeddings, dim=1)  # Pool to [total_patches, hidden_dim]
 
                 # Reshape back: [batch, num_patches, hidden_dim]
@@ -658,7 +664,7 @@ class SimplifiedBrainRetrieval(nn.Module):
                 # Add temporal positional embeddings
                 time_indices = torch.arange(num_time_patches, device=eeg_input.device).unsqueeze(0)
                 time_indices = time_indices.expand(batch_size, -1)
-                temporal_emb = self.positional_embeddings.temporal_embeddings(time_indices)
+                temporal_emb = self.dynamic_encoders['positional_embeddings'].temporal_embeddings(time_indices)
 
                 final_features = patch_features + temporal_emb
             else:
@@ -683,7 +689,7 @@ class SimplifiedBrainRetrieval(nn.Module):
                     batch_patches = patches.reshape(batch_size * num_time_patches, patch_length, channels)
 
                     # Single CNN forward pass with all channels
-                    batch_embeddings = self.cnn_preprocessor(batch_patches)
+                    batch_embeddings = self.dynamic_encoders['cnn_preprocessor'](batch_patches)
                     batch_embeddings = torch.mean(batch_embeddings, dim=1)  # [total_patches, hidden_dim]
 
                     # Pool across patches within word: [batch, hidden_dim]
@@ -699,7 +705,7 @@ class SimplifiedBrainRetrieval(nn.Module):
             # Add word-level positional embeddings
             word_positions = torch.arange(num_words, device=eeg_input.device).unsqueeze(0)
             word_positions = word_positions.expand(batch_size, -1)
-            word_pos_emb = self.positional_embeddings.word_embeddings(word_positions)
+            word_pos_emb = self.dynamic_encoders['positional_embeddings'].word_embeddings(word_positions)
             final_features = final_features + word_pos_emb
 
             return final_features, 'word'
@@ -708,23 +714,28 @@ class SimplifiedBrainRetrieval(nn.Module):
         """Apply TRUE LaBraM preprocessing"""
         batch_size, num_words, time_samples, channels = eeg_input.shape
 
-        if self.labram_patcher is None:
+        # ✅ FIXED: Check ModuleDict and store modules properly
+        if 'labram_patcher' not in self.dynamic_encoders:
             patch_length = 200
-            self.labram_patcher = LaBramChannelPatcher(patch_length, channels, time_samples // patch_length).to(
+            patcher = LaBramChannelPatcher(patch_length, channels, time_samples // patch_length).to(
                 eeg_input.device)
-            self.cnn_preprocessor = LaBramCNNPreprocessor_TRUE(self.hidden_dim,
-                                                               2 if self.eeg_arch == 'simple' else 3).to(
+            cnn = LaBramCNNPreprocessor_TRUE(self.hidden_dim,
+                                             2 if self.eeg_arch == 'simple' else 3).to(
                 eeg_input.device)
             num_time_patches = time_samples // patch_length
-            self.labram_pos_embeddings = LaBramPositionalEmbeddings(self.hidden_dim, num_words, num_time_patches,
-                                                                    channels).to(eeg_input.device)
+            pos_emb = LaBramPositionalEmbeddings(self.hidden_dim, num_words, num_time_patches,
+                                                 channels).to(eeg_input.device)
+
+            self.dynamic_encoders['labram_patcher'] = patcher
+            self.dynamic_encoders['labram_cnn'] = cnn
+            self.dynamic_encoders['labram_pos_embeddings'] = pos_emb
             print(f"TRUE LaBraM: {channels}ch × {num_time_patches}patches = {channels * num_time_patches} patches/word")
 
-        patches, ch_idx, t_idx = self.labram_patcher(eeg_input)
+        patches, ch_idx, t_idx = self.dynamic_encoders['labram_patcher'](eeg_input)
         _, num_words, num_patches, patch_length = patches.shape
         patches_flat = patches.reshape(batch_size * num_words * num_patches, patch_length)
-        patch_features = self.cnn_preprocessor(patches_flat).reshape(batch_size, num_words, num_patches,
-                                                                     self.hidden_dim)
+        patch_features = self.dynamic_encoders['labram_cnn'](patches_flat).reshape(batch_size, num_words, num_patches,
+                                                                                   self.hidden_dim)
 
         # ch_idx and t_idx are [num_patches] for one word only
         # Repeat them for all words to match the full sequence
@@ -735,9 +746,10 @@ class SimplifiedBrainRetrieval(nn.Module):
                                                                                                          num_words,
                                                                                                          num_patches).reshape(
             batch_size, num_words * num_patches)
-        pos_emb = self.labram_pos_embeddings(ch_idx_all, t_idx_all, word_indices).reshape(batch_size, num_words,
-                                                                                          num_patches,
-                                                                                          self.hidden_dim)
+        pos_emb = self.dynamic_encoders['labram_pos_embeddings'](ch_idx_all, t_idx_all, word_indices).reshape(
+            batch_size, num_words,
+            num_patches,
+            self.hidden_dim)
 
         patch_features = patch_features + pos_emb
 
@@ -872,13 +884,15 @@ class SimplifiedBrainRetrieval(nn.Module):
             # ABLATION HANDLING
             if self.ablation_mode == 'temporal_only':
                 # Create temporal encoder if needed (with wider dimension)
-                if self.temporal_eeg_encoder is None:
+                # ✅ FIXED: Check ModuleDict and store encoder properly
+                if 'temporal_encoder' not in self.dynamic_encoders:
                     temporal_input_size = temporal_features.shape[-1]
-                    self.temporal_eeg_encoder = self._create_eeg_encoder(temporal_input_size, eeg_input.device)
+                    encoder = self._create_eeg_encoder(temporal_input_size, eeg_input.device)
+                    self.dynamic_encoders['temporal_encoder'] = encoder
 
                 # Encode only temporal
                 temporal_representations = self._encode_decomposed_features(
-                    temporal_features, self.temporal_eeg_encoder, self.temporal_projection
+                    temporal_features, self.dynamic_encoders['temporal_encoder'], self.temporal_projection
                 )
 
                 # Apply pooling to temporal only
@@ -889,13 +903,15 @@ class SimplifiedBrainRetrieval(nn.Module):
 
             elif self.ablation_mode == 'spatial_only':
                 # Create spatial encoder if needed (with wider dimension)
-                if self.spatial_eeg_encoder is None:
+                # ✅ FIXED: Check ModuleDict and store encoder properly
+                if 'spatial_encoder' not in self.dynamic_encoders:
                     spatial_input_size = spatial_features.shape[-1]
-                    self.spatial_eeg_encoder = self._create_eeg_encoder(spatial_input_size, eeg_input.device)
+                    encoder = self._create_eeg_encoder(spatial_input_size, eeg_input.device)
+                    self.dynamic_encoders['spatial_encoder'] = encoder
 
                 # Encode only spatial
                 spatial_representations = self._encode_decomposed_features(
-                    spatial_features, self.spatial_eeg_encoder, self.spatial_projection
+                    spatial_features, self.dynamic_encoders['spatial_encoder'], self.spatial_projection
                 )
 
                 # Apply pooling to spatial only
@@ -906,19 +922,23 @@ class SimplifiedBrainRetrieval(nn.Module):
 
             else:  # ablation_mode == 'none' - full model
                 # Create both encoders if needed
-                if self.temporal_eeg_encoder is None:
+                # ✅ FIXED: Check ModuleDict and store encoders properly
+                if 'temporal_encoder' not in self.dynamic_encoders:
                     temporal_input_size = temporal_features.shape[-1]
                     spatial_input_size = spatial_features.shape[-1]
 
-                    self.temporal_eeg_encoder = self._create_eeg_encoder(temporal_input_size, eeg_input.device)
-                    self.spatial_eeg_encoder = self._create_eeg_encoder(spatial_input_size, eeg_input.device)
+                    temporal_enc = self._create_eeg_encoder(temporal_input_size, eeg_input.device)
+                    spatial_enc = self._create_eeg_encoder(spatial_input_size, eeg_input.device)
+
+                    self.dynamic_encoders['temporal_encoder'] = temporal_enc
+                    self.dynamic_encoders['spatial_encoder'] = spatial_enc
 
                 # Encode temporal and spatial separately
                 temporal_representations = self._encode_decomposed_features(
-                    temporal_features, self.temporal_eeg_encoder, self.temporal_projection
+                    temporal_features, self.dynamic_encoders['temporal_encoder'], self.temporal_projection
                 )
                 spatial_representations = self._encode_decomposed_features(
-                    spatial_features, self.spatial_eeg_encoder, self.spatial_projection
+                    spatial_features, self.dynamic_encoders['spatial_encoder'], self.spatial_projection
                 )
 
                 # Apply pooling strategy to both
@@ -939,17 +959,21 @@ class SimplifiedBrainRetrieval(nn.Module):
         batch_size, num_words, time_samples, channels = eeg_input.shape
 
         # Create CNN preprocessor if needed - FIXED: Use actual number of channels
-        if self.cnn_preprocessor is None:
-            self.cnn_preprocessor = LaBramCNNPreprocessor(
+        # ✅ FIXED: Check ModuleDict and store modules properly
+        if 'cnn_preprocessor' not in self.dynamic_encoders:
+            cnn_prep = LaBramCNNPreprocessor(
                 input_dim=channels,  # ✅ FIXED: Process all channels together
                 hidden_dim=self.hidden_dim,
                 num_layers=2 if self.eeg_arch == 'simple' else 3
             ).to(eeg_input.device)
 
-            self.positional_embeddings = EEGPositionalEmbeddings(
+            pos_emb = EEGPositionalEmbeddings(
                 hidden_dim=self.hidden_dim,
                 max_channels=channels
             ).to(eeg_input.device)
+
+            self.dynamic_encoders['cnn_preprocessor'] = cnn_prep
+            self.dynamic_encoders['positional_embeddings'] = pos_emb
 
             print(f"Created CNN preprocessor with {channels} input channels (processing all channels together)")
 
@@ -957,19 +981,22 @@ class SimplifiedBrainRetrieval(nn.Module):
         cnn_features, level = self._apply_labram_preprocessing(eeg_input)
 
         # Create main encoder if needed (works with CNN-preprocessed features)
-        if self.eeg_encoder is None:
-            self.eeg_encoder = self._create_eeg_encoder(self.hidden_dim, eeg_input.device, is_cnn_preprocessed=True)
+        # ✅ FIXED: Check and store in dynamic_encoders
+        if 'main_eeg_encoder' not in self.dynamic_encoders:
+            encoder = self._create_eeg_encoder(self.hidden_dim, eeg_input.device, is_cnn_preprocessed=True)
+            self.dynamic_encoders['main_eeg_encoder'] = encoder
+            self.eeg_encoder = encoder  # Keep reference for backward compatibility
 
         # Process CNN features through main encoder
         if level == 'sequence':
             # Sequence-level: [batch, total_patches, hidden_dim]
             if self.eeg_arch == 'transformer':
-                sequence_representations = self.eeg_encoder(cnn_features)
+                sequence_representations = self.dynamic_encoders['main_eeg_encoder'](cnn_features)
             else:
                 # For simple/complex: flatten and process
                 batch_size, seq_len, hidden_dim = cnn_features.shape
                 cnn_flat = cnn_features.view(batch_size * seq_len, hidden_dim)
-                encoded_flat = self.eeg_encoder(cnn_flat)
+                encoded_flat = self.dynamic_encoders['main_eeg_encoder'](cnn_flat)
                 sequence_representations = encoded_flat.view(batch_size, seq_len, hidden_dim)
 
             # Apply pooling (similar to sequence_concat)
@@ -1067,20 +1094,24 @@ class SimplifiedBrainRetrieval(nn.Module):
         input_size = channels
 
         # Create EEG encoder if needed - always use sequence processing for consistent pooling
-        if self.eeg_encoder is None:
-            self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_input.device)
+        # ✅ FIXED: Check and store in dynamic_encoders
+        if 'main_eeg_encoder' not in self.dynamic_encoders:
+            encoder = self._create_eeg_encoder(input_size, eeg_input.device)
+            self.dynamic_encoders['main_eeg_encoder'] = encoder
+            self.eeg_encoder = encoder  # Keep reference for backward compatibility
             print(f"Created sequence-level EEG encoder ({self.eeg_arch}) for concatenated input")
 
         # Process concatenated sequence through encoder
         if self.eeg_arch == 'transformer':
             # Transformer can handle the sequence directly
             # eeg_concat: [batch, total_time, channels]
-            sequence_representations = self.eeg_encoder(eeg_concat)  # [batch, total_time, hidden_dim]
+            sequence_representations = self.dynamic_encoders['main_eeg_encoder'](
+                eeg_concat)  # [batch, total_time, hidden_dim]
         else:
             # For simple/complex: process each time step individually, then reshape back
             eeg_flat = eeg_concat.view(batch_size * (num_words * time_samples),
                                        channels)  # [batch*total_time, channels]
-            encoded_flat = self.eeg_encoder(eeg_flat)  # [batch*total_time, hidden_dim]
+            encoded_flat = self.dynamic_encoders['main_eeg_encoder'](eeg_flat)  # [batch*total_time, hidden_dim]
             sequence_representations = encoded_flat.view(batch_size, num_words * time_samples,
                                                          self.hidden_dim)  # [batch, total_time, hidden_dim]
 
@@ -1194,16 +1225,19 @@ class SimplifiedBrainRetrieval(nn.Module):
         input_size = time_samples * channels
 
         # Create EEG encoder if needed
-        if self.eeg_encoder is None:
-            self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_input.device)
+        # ✅ FIXED: Check and store in dynamic_encoders
+        if 'main_eeg_encoder' not in self.dynamic_encoders:
+            encoder = self._create_eeg_encoder(input_size, eeg_input.device)
+            self.dynamic_encoders['main_eeg_encoder'] = encoder
+            self.eeg_encoder = encoder  # Keep reference for backward compatibility
 
         # Encode EEG words
         if self.eeg_arch == 'transformer':
             eeg_reshaped = eeg_input.view(batch_size, num_words, input_size)
-            word_representations = self.eeg_encoder(eeg_reshaped)
+            word_representations = self.dynamic_encoders['main_eeg_encoder'](eeg_reshaped)
         else:
             eeg_flat = eeg_input.view(batch_size * num_words, input_size)
-            encoded = self.eeg_encoder(eeg_flat)
+            encoded = self.dynamic_encoders['main_eeg_encoder'](eeg_flat)
             word_representations = encoded.view(batch_size, num_words, self.hidden_dim)
 
         # Project to final dimension
@@ -1488,31 +1522,8 @@ class CrossEncoderBrainRetrieval(nn.Module):
         self.use_pretrained_text = use_pretrained_text
         self.pooling_strategy = 'cross'
 
-        # Initialize CLS token pooling components if needed
-        if eeg_spatial_temporal_pooling == 'cls' and use_temporal_spatial_decomp:
-            # CLS tokens for temporal and spatial pooling
-            self.temporal_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
-            self.spatial_cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
-
-            # Self-attention layers for CLS pooling
-            self.temporal_cls_attention = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=8,
-                dropout=0.1,
-                batch_first=True
-            )
-            self.spatial_cls_attention = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=8,
-                dropout=0.1,
-                batch_first=True
-            )
-            print(f"Initialized CLS token pooling for spatial-temporal decomposition")
-        else:
-            self.temporal_cls_token = None
-            self.spatial_cls_token = None
-            self.temporal_cls_attention = None
-            self.spatial_cls_attention = None
+        # ✅ FIXED: Add ModuleDict for dynamically created encoders
+        self.dynamic_encoders = nn.ModuleDict()
 
         # Text encoder - either pretrained or simple from-scratch
         if use_pretrained_text:
@@ -1654,15 +1665,18 @@ class CrossEncoderBrainRetrieval(nn.Module):
             num_words, time_samples, channels = eeg_queries.shape[1:]
             input_size = time_samples * channels
 
-            if self.eeg_encoder is None:
-                self.eeg_encoder = self._create_eeg_encoder(input_size, eeg_queries.device)
+            # ✅ FIXED: Check and store in dynamic_encoders
+            if 'main_eeg_encoder' not in self.dynamic_encoders:
+                encoder = self._create_eeg_encoder(input_size, eeg_queries.device)
+                self.dynamic_encoders['main_eeg_encoder'] = encoder
+                self.eeg_encoder = encoder  # Keep reference for backward compatibility
 
             if self.eeg_arch == 'transformer':
                 eeg_reshaped = eeg_queries.view(batch_size, num_words, input_size)
-                query_representations = self.eeg_encoder(eeg_reshaped)
+                query_representations = self.dynamic_encoders['main_eeg_encoder'](eeg_reshaped)
             else:
                 eeg_flat = eeg_queries.view(batch_size * num_words, input_size)
-                encoded = self.eeg_encoder(eeg_flat)
+                encoded = self.dynamic_encoders['main_eeg_encoder'](eeg_flat)
                 query_representations = encoded.view(batch_size, num_words, self.hidden_dim)
 
             query_representations = self.eeg_projection(query_representations)
