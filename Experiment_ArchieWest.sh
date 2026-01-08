@@ -20,9 +20,8 @@ python controller.py \
     /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
   --dataset_types nieuwland alice \
-  --use_temporal_spatial_decomp \
-  --decomp_level word \
-  --eeg_spatial_temporal_pooling max \
+  --use_cnn_preprocessing \
+  --use_sequence_concat \
   --pooling_strategy cls \
   --query_type eeg \
   --no_lora \
