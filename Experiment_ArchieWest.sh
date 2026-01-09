@@ -21,13 +21,13 @@ python controller.py \
     /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
     /users/gxb18167/WWW26/dataset/narrative_ict_pairs_RUNTIME_MASKING.npy/ \
     /users/gxb18167/WWW26/dataset/derco_ict_pairs_RUNTIME_MASKING.npy/ \
-  --dataset_types nieuwland alice \
+  --dataset_types nieuwland alice narrative derco \
   --pooling_strategy cls \
   --query_type eeg \
   --no_lora \
   --eeg_arch transformer \
   --colbert_model_name colbert-ir/colbertv2.0 \
-  --lr 1e-4 --patience 3 --epochs 100 --batch_size 8 --max_text_len 256 \
+  --lr 1e-4 --patience 10 --epochs 100 --batch_size 32 --max_text_len 256 \
   --enable_multi_masking_validation --validation_masking_levels 90 \
   --multi_masking_frequency 50 --primary_masking_level 90 --training_masking_level 90 \
   --enable_test_evaluation --test_masking_levels 0 25 50 75 90 100
