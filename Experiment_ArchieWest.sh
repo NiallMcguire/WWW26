@@ -24,6 +24,8 @@ python controller.py \
   --dataset_types nieuwland alice narrative derco \
   --pooling_strategy cls \
   --query_type eeg \
+  --use_temporal_spatial_decomp \
+  --decomp_level word \
   --no_lora \
   --eeg_arch transformer \
   --colbert_model_name colbert-ir/colbertv2.0 \
