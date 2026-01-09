@@ -19,6 +19,8 @@ python controller.py \
   --data_paths \
     /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/nieuwland_ict_pairs_RUNTIME_MASKING.npy \
     /users/gxb18167/ECIR2026/SpatialTemporalDecompositionMultiDataset/Dataset/alice_ict_pairs_RUNTIME_MASKING.npy \
+    /users/gxb18167/WWW26/dataset/narrative_ict_pairs_RUNTIME_MASKING.npy/ \
+    /users/gxb18167/WWW26/dataset/derco_ict_pairs_RUNTIME_MASKING.npy/ \
   --dataset_types nieuwland alice \
   --pooling_strategy cls \
   --query_type eeg \
